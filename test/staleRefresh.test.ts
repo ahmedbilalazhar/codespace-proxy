@@ -44,6 +44,7 @@ describe('stale-listener refresh', () => {
     const outcome = await recoverProxy(baseCfg(), execWithStaleSsh(), {
       checkPort: async () => true,
       checkAws: async () => true,
+      socksProbe: async () => ({ connected: false, ip: null, service: null, detail: 'dead handshake' }),
       spawnSshFn: () => {
         spawned += 1;
         return { ok: true, pid: 4001, detail: 'ssh spawned (pid 4001)' };
@@ -86,6 +87,7 @@ describe('stale-listener refresh', () => {
     const outcome = await recoverProxy(baseCfg(), execForeign, {
       checkPort: async () => true,
       checkAws: async () => true,
+      socksProbe: async () => ({ connected: false, ip: null, service: null, detail: 'dead handshake' }),
       socksE2E: async () => {
         throw new Error('SOCKS5 handshake got no reply');
       },

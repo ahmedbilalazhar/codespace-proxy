@@ -58,8 +58,10 @@ function readExactly(socket: net.Socket, n: number, timeoutMs: number): Promise<
     const onData = (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       if (buf.length >= n) {
+        socket.pause();
         cleanup();
-        resolve(buf.slice(0, n));
+        if (buf.length > n) socket.unshift(buf.subarray(n));
+        resolve(buf.subarray(0, n));
       }
     };
     const onError = (e: Error) => {
@@ -73,6 +75,7 @@ function readExactly(socket: net.Socket, n: number, timeoutMs: number): Promise<
     socket.on('data', onData);
     socket.once('error', onError);
     socket.once('close', onClose);
+    socket.resume();
   });
 }
 
@@ -160,6 +163,10 @@ function encodeDomainRequest(host: string, port: number): Buffer {
  * Fetch one plain-HTTP URL through a SOCKS5 proxy.
  * Resolves with the trimmed response body; rejects with a one-line Error.
  */
+class SocksExchangeError extends Error {
+  constructor(message: string, public connected: boolean) { super(message); }
+}
+
 export async function fetchViaSocks5(
   socksHost: string,
   socksPort: number,
@@ -170,10 +177,12 @@ export async function fetchViaSocks5(
   deps: SocksE2EDeps = {},
 ): Promise<string> {
   const started = Date.now();
-  const remaining = () => Math.max(500, timeoutMs - (Date.now() - started));
+  const remaining = () => Math.max(1, timeoutMs - (Date.now() - started));
   const socket = deps.connect
     ? await deps.connect(socksHost, socksPort, timeoutMs)
     : await connectSocksServer(socksHost, socksPort, timeoutMs);
+  let connected = false;
+  socket.pause();
   try {
     // 1. Greeting: VER=5, NMETHODS=1, METHODS=[0x00 no-auth].
     await writeAll(socket, Buffer.from([0x05, 0x01, 0x00]));
@@ -204,6 +213,7 @@ export async function fetchViaSocks5(
     } else {
       throw new Error(`bad SOCKS5 CONNECT address type 0x${atyp.toString(16)}`);
     }
+    connected = true;
     // 3. Plain HTTP GET through the established tunnel.
     const req =
       `GET ${httpPath} HTTP/1.1\r\nHost: ${targetHost}\r\nConnection: close\r\n` +
@@ -236,6 +246,7 @@ export async function fetchViaSocks5(
         }
       });
       // Half-close from the server may arrive as 'end' without 'close' yet.
+      socket.resume();
       socket.once('end', () => {
         // Give 'close' a tick to fire; if data already complete, resolve now.
         setTimeout(() => {
@@ -258,7 +269,30 @@ export async function fetchViaSocks5(
     if (parseInt(m[1], 10) !== 200) {
       throw new Error(`echo service answered HTTP ${m[1]} through SOCKS5`);
     }
-    return raw.slice(sep + 4).trim();
+    const headers = raw.slice(0, sep);
+    const body = Buffer.from(raw.slice(sep + 4), 'utf8');
+    if (/^transfer-encoding:\s*chunked\s*$/im.test(headers)) {
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      for (;;) {
+        const lineEnd = body.indexOf('\r\n', offset);
+        if (lineEnd < 0) throw new Error('incomplete chunked response through SOCKS5');
+        const sizeText = body.subarray(offset, lineEnd).toString('ascii').split(';')[0];
+        if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error('invalid chunk size through SOCKS5');
+        const size = parseInt(sizeText, 16);
+        offset = lineEnd + 2;
+        if (size === 0) break;
+        if (offset + size + 2 > body.length || body.subarray(offset + size, offset + size + 2).toString() !== '\r\n') {
+          throw new Error('incomplete chunked response through SOCKS5');
+        }
+        chunks.push(body.subarray(offset, offset + size));
+        offset += size + 2;
+      }
+      return Buffer.concat(chunks).toString('utf8').trim();
+    }
+    return body.toString('utf8').trim();
+  } catch (e) {
+    throw new SocksExchangeError((e as Error).message, connected);
   } finally {
     try {
       socket.destroy();
@@ -344,10 +378,7 @@ export async function probeSocksTunnel(
       return { connected: true, ip: null, service: t.url, detail: `SOCKS CONNECT ok via ${t.url}; echo body unusable (${body.slice(0, 40)})` };
     } catch (e) {
       const msg = (e as Error).message;
-      const tunnelBroken =
-        /handshake refused|CONNECT failed|bad SOCKS5|address type|closed before handshake|refused|ECONNREFUSED/i.test(msg);
-      if (!tunnelBroken) {
-        // Timeout / non-IP / HTTP status after the CONNECT channel opened.
+      if (e instanceof SocksExchangeError && e.connected) {
         return { connected: true, ip: null, service: t.url, detail: `SOCKS CONNECT channel opened via ${t.url}; echo unusable (${msg.split('\n')[0].slice(0, 120)})` };
       }
       // Real tunnel failure for this target; try the next echo target.

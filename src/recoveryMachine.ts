@@ -47,6 +47,7 @@ import {
   killPid,
   listenerPidForPort,
   listOurSsh,
+  listOurHpts,
   spawnSsh,
   spawnHpts,
   type ProxyProcConfig,
@@ -69,7 +70,7 @@ export type RecoveryState =
   | 'READY'
   | 'RECOVERY_FAILED';
 
-export interface RecoveryMachineConfig extends AwsNetConfig, ProxyProcConfig {
+export interface RecoveryMachineConfig extends AwsNetConfig, Omit<ProxyProcConfig, 'sshPort'> {
   expectedExternalIp: string;
   /** Stage-1 HTTP verify target (gstatic 204; never an echo service, never Zen). */
   transportProbeUrl?: string;
@@ -150,6 +151,7 @@ export interface RecoveryOutcome {
 }
 
 export interface RecoveryDeps {
+  canContinue?: () => boolean;
   checkPort?: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
   checkAws?: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
   fetchDirectIp?: (urls: string[], timeoutMs: number) => Promise<{ ip: string; service: string }>;
@@ -200,7 +202,11 @@ export function recoverProxy(
   if (inFlight) {
     return inFlight;
   }
-  const p = runRecoveryInner(cfg, exec, deps, spawnFn).finally(() => {
+  const guardedExec: ExecAsync = (file, args, timeout) => {
+    if (deps.canContinue && !deps.canContinue()) return Promise.reject(new Error('Proxy is turned off'));
+    return exec(file, args, timeout);
+  };
+  const p = runRecoveryInner(cfg, guardedExec, deps, spawnFn).finally(() => {
     inFlight = null;
   });
   inFlight = p;
@@ -230,7 +236,9 @@ async function runRecoveryInner(
   const emit = (tag: RecoveryLog['tag'], message: string) => {
     logs.push({ tag, message, at: stamp() });
   };
+  const assertActive = () => { if (deps.canContinue && !deps.canContinue()) throw new Error('Proxy is turned off; recovery cancelled'); };
   const enter = (s: RecoveryState, detail: string) => {
+    assertActive();
     path.push(s);
     deps.onState?.(s, detail);
   };
@@ -243,425 +251,485 @@ async function runRecoveryInner(
     }
   };
 
-  // -- A. Is :1080 listening? ---------------------------------------------
-  emit('PROXY CHECK', `probing TCP ${cfg.socksHost}:${cfg.socksPort}`);
-  const socksListening = await safeCheck(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs);
-  emit('SOCKS CHECK', `TCP ${cfg.socksHost}:${cfg.socksPort} ${socksListening ? 'listening' : 'refused'}`);
-
-  // -- B. Is AWS :22 reachable (direct)? -----------------------------------
-  emit('AWS SSH CHECK', `probing TCP ${cfg.ec2Host}:${cfg.sshPort} (direct, proxy bypassed)`);
-  let awsUp = false;
   try {
-    awsUp = await checkAws(cfg.ec2Host, cfg.sshPort, cfg.checkTimeoutMs);
-  } catch {
-    awsUp = false;
-  }
-  emit('AWS SSH CHECK', `TCP ${cfg.ec2Host}:${cfg.sshPort} ${awsUp ? 'reachable' : 'unreachable'}`);
+    assertActive();
+    // -- A. Is :1080 listening? ---------------------------------------------
+    emit('PROXY CHECK', `probing TCP ${cfg.socksHost}:${cfg.socksPort}`);
+    const socksListening = await safeCheck(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs);
+    emit('SOCKS CHECK', `TCP ${cfg.socksHost}:${cfg.socksPort} ${socksListening ? 'listening' : 'refused'}`);
 
-  if (!awsUp) {
-    enter('AWS_SSH_UNREACHABLE', `TCP ${cfg.ec2Host}:${cfg.sshPort} unreachable`);
-    // -- bootstrap: direct public IP (NEVER via the broken proxy) ---------
-    emit('PUBLIC IP', `discovering current public IP directly (${DIRECT_IP_URLS.length} services, proxy bypassed)`);
-    const fetchIp =
-      deps.fetchDirectIp ??
-      ((urls: string[], t: number) => fetchDirectPublicIp((u, tt) => fetchDirectUrl(u, tt), urls, t));
+    // -- B. Is AWS :22 reachable (direct)? -----------------------------------
+    emit('AWS SSH CHECK', `probing TCP ${cfg.ec2Host}:${cfg.sshPort} (direct, proxy bypassed)`);
+    let awsUp = false;
     try {
-      const found = await fetchIp(DIRECT_IP_URLS, cfg.checkTimeoutMs);
-      publicIpDirect = found.ip;
-      emit('PUBLIC IP', `direct public IP ${found.ip} (via ${found.service}, proxy bypassed)`);
-    } catch (e) {
-      const detail = (e as Error).message.slice(0, 200);
-      emit('RECOVERY FAILURE', `direct public-IP discovery failed: ${detail}`);
-      enter('RECOVERY_FAILED', detail);
-      return fail();
+      awsUp = await checkAws(cfg.ec2Host, cfg.sshPort, cfg.checkTimeoutMs);
+    } catch {
+      awsUp = false;
     }
-    // -- SG repair (only when configured; never 0.0.0.0/0) ----------------
-    if (cfg.securityGroupId.trim()) {
-      enter('SG_REPAIRING', `repairing SG ${cfg.securityGroupId.trim()} for ${publicIpDirect}/32`);
-      emit('SECURITY GROUP UPDATE', `describing TCP-22 rules on ${cfg.securityGroupId.trim()} (existing AWS CLI profile)`);
-      const repair =
-        deps.repairSg ??
-        ((c: RecoveryMachineConfig, ip: string) => ensureSshAccess(exec, c, ip));
-      let repaired = false;
-      for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
-        try {
-          const r = await repair(cfg, publicIpDirect as string);
-          emit('SECURITY GROUP UPDATE', r.detail);
-          if (r.ok && r.authorizedCurrent) {
-            sgRepaired = r.revoked.length > 0 || /already authorized|verified/.test(r.detail);
-            repaired = true;
+    emit('AWS SSH CHECK', `TCP ${cfg.ec2Host}:${cfg.sshPort} ${awsUp ? 'reachable' : 'unreachable'}`);
+
+    if (!awsUp) {
+      enter('AWS_SSH_UNREACHABLE', `TCP ${cfg.ec2Host}:${cfg.sshPort} unreachable`);
+      // -- bootstrap: direct public IP (NEVER via the broken proxy) ---------
+      emit('PUBLIC IP', `discovering current public IP directly (${DIRECT_IP_URLS.length} services, proxy bypassed)`);
+      const fetchIp =
+        deps.fetchDirectIp ??
+        ((urls: string[], t: number) => fetchDirectPublicIp((u, tt) => fetchDirectUrl(u, tt), urls, t));
+      try {
+        const found = await fetchIp(DIRECT_IP_URLS, cfg.checkTimeoutMs);
+        publicIpDirect = found.ip;
+        emit('PUBLIC IP', `direct public IP ${found.ip} (via ${found.service}, proxy bypassed)`);
+      } catch (e) {
+        const detail = (e as Error).message.slice(0, 200);
+        emit('RECOVERY FAILURE', `direct public-IP discovery failed: ${detail}`);
+        enter('RECOVERY_FAILED', detail);
+        return fail();
+      }
+      // -- SG repair (only when configured; never 0.0.0.0/0) ----------------
+      if (cfg.securityGroupId.trim()) {
+        enter('SG_REPAIRING', `repairing SG ${cfg.securityGroupId.trim()} for ${publicIpDirect}/32`);
+        emit('SECURITY GROUP UPDATE', `describing TCP-22 rules on ${cfg.securityGroupId.trim()} (existing AWS CLI profile)`);
+        const repair =
+          deps.repairSg ??
+          ((c: RecoveryMachineConfig, ip: string) => ensureSshAccess(exec, c, ip));
+        let repaired = false;
+        for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
+          try {
+            assertActive();
+            const r = await repair(cfg, publicIpDirect as string);
+            emit('SECURITY GROUP UPDATE', r.detail);
+            if (r.ok && r.authorizedCurrent) {
+              sgRepaired = r.revoked.length > 0 || /already authorized|verified/.test(r.detail);
+              repaired = true;
+              break;
+            }
+            if (attempt < cfg.maxAttempts - 1) {
+              const wait = backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs);
+              emit('SECURITY GROUP UPDATE', `retry ${attempt + 1}/${cfg.maxAttempts} in ${wait}ms`);
+              await sleep(wait);
+            } else {
+              emit('RECOVERY FAILURE', `SG repair failed: ${r.detail}`);
+              enter('RECOVERY_FAILED', r.detail);
+              return fail();
+            }
+          } catch (e) {
+            const detail = (e as Error).message.slice(0, 200);
+            emit('RECOVERY FAILURE', `SG repair threw: ${detail}`);
+            enter('RECOVERY_FAILED', detail);
+            return fail();
+          }
+        }
+        if (!repaired) {
+          enter('RECOVERY_FAILED', 'SG repair exhausted retries');
+          return fail();
+        }
+        // -- retry TCP 22 after repair --------------------------------------
+        emit('AWS SSH CHECK', `re-probing TCP ${cfg.ec2Host}:${cfg.sshPort} after SG repair`);
+        let upAfter = false;
+        for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
+          try {
+            upAfter = await checkAws(cfg.ec2Host, cfg.sshPort, cfg.checkTimeoutMs);
+          } catch {
+            upAfter = false;
+          }
+          if (upAfter) {
             break;
           }
           if (attempt < cfg.maxAttempts - 1) {
-            const wait = backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs);
-            emit('SECURITY GROUP UPDATE', `retry ${attempt + 1}/${cfg.maxAttempts} in ${wait}ms`);
-            await sleep(wait);
-          } else {
-            emit('RECOVERY FAILURE', `SG repair failed: ${r.detail}`);
-            enter('RECOVERY_FAILED', r.detail);
-            return fail();
+            await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
           }
-        } catch (e) {
-          const detail = (e as Error).message.slice(0, 200);
-          emit('RECOVERY FAILURE', `SG repair threw: ${detail}`);
-          enter('RECOVERY_FAILED', detail);
+        }
+        emit('AWS SSH CHECK', `TCP ${cfg.ec2Host}:${cfg.sshPort} after SG repair: ${upAfter ? 'reachable' : 'still unreachable'}`);
+        if (!upAfter) {
+          // Distinguish "SG fixed but route/SSH still down" from SG failure.
+          const d = await (deps.describeSg ?? ((c: RecoveryMachineConfig) => describeSshRules(exec, c)))(cfg);
+          emit('SECURITY GROUP UPDATE', `post-repair describe: ${d.detail}`);
+          enter('RECOVERY_FAILED', `AWS SSH still unreachable after SG repair (${publicIpDirect}/32 authorized)`);
           return fail();
         }
-      }
-      if (!repaired) {
-        enter('RECOVERY_FAILED', 'SG repair exhausted retries');
+        awsUp = true;
+      } else {
+        emit('SECURITY GROUP UPDATE', 'no securityGroupId configured — SG auto-repair disabled; cannot fix IP restriction automatically');
+        enter('RECOVERY_FAILED', `AWS SSH unreachable and no securityGroupId configured (direct IP ${publicIpDirect})`);
         return fail();
       }
-      // -- retry TCP 22 after repair --------------------------------------
-      emit('AWS SSH CHECK', `re-probing TCP ${cfg.ec2Host}:${cfg.sshPort} after SG repair`);
-      let upAfter = false;
-      for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
+    }
+
+    // -- C. :22 reachable but :1080 not -> single-owner ssh recovery ---------
+    if (!socksListening) {
+      const ours = await (async () => {
         try {
-          upAfter = await checkAws(cfg.ec2Host, cfg.sshPort, cfg.checkTimeoutMs);
-        } catch {
-          upAfter = false;
+          if (deps.listSsh) {
+            return await deps.listSsh(cfg);
+          }
+          const owner = await listenerPidForPort(exec, cfg.socksPort);
+          return await dedupOurSsh(exec, cfg, owner);
+        } catch (e) {
+          return { kept: null, killed: [], detail: `ssh dedup probe failed: ${(e as Error).message.slice(0, 160)}` };
         }
-        if (upAfter) {
-          break;
-        }
-        if (attempt < cfg.maxAttempts - 1) {
-          await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
-        }
+      })();
+      if (!ours.kept) {
+        enter('SSH_PROCESS_DOWN', ours.detail);
+      } else {
+        enter('SOCKS_DOWN', `owned ssh.exe (pid ${ours.kept}) but :${cfg.socksPort} refused — stale tunnel`);
       }
-      emit('AWS SSH CHECK', `TCP ${cfg.ec2Host}:${cfg.sshPort} after SG repair: ${upAfter ? 'reachable' : 'still unreachable'}`);
-      if (!upAfter) {
-        // Distinguish "SG fixed but route/SSH still down" from SG failure.
-        const d = await (deps.describeSg ?? ((c: RecoveryMachineConfig) => describeSshRules(exec, c)))(cfg);
-        emit('SECURITY GROUP UPDATE', `post-repair describe: ${d.detail}`);
-        enter('RECOVERY_FAILED', `AWS SSH still unreachable after SG repair (${publicIpDirect}/32 authorized)`);
-        return fail();
+      if (ours.killed.length > 0) {
+        emit('SSH STOP', `terminated stale/redundant owned ssh.exe pid(s) [${ours.killed.join(', ')}]`);
+      } else {
+        emit('SSH STOP', `ssh dedup: ${ours.detail}`);
       }
-      awsUp = true;
-    } else {
-      emit('SECURITY GROUP UPDATE', 'no securityGroupId configured — SG auto-repair disabled; cannot fix IP restriction automatically');
-      enter('RECOVERY_FAILED', `AWS SSH unreachable and no securityGroupId configured (direct IP ${publicIpDirect})`);
-      return fail();
-    }
-  }
 
-  // -- C. :22 reachable but :1080 not -> single-owner ssh recovery ---------
-  if (!socksListening) {
-    const ours = await (async () => {
-      try {
-        if (deps.listSsh) {
-          return await deps.listSsh(cfg);
-        }
-        const owner = await listenerPidForPort(exec, cfg.socksPort);
-        return await dedupOurSsh(exec, cfg, owner);
-      } catch (e) {
-        return { kept: null, killed: [], detail: `ssh dedup probe failed: ${(e as Error).message.slice(0, 160)}` };
-      }
-    })();
-    if (!ours.kept) {
-      enter('SSH_PROCESS_DOWN', ours.detail);
-    } else {
-      enter('SOCKS_DOWN', `owned ssh.exe (pid ${ours.kept}) but :${cfg.socksPort} refused — stale tunnel`);
-    }
-    if (ours.killed.length > 0) {
-      emit('SSH STOP', `terminated stale/redundant owned ssh.exe pid(s) [${ours.killed.join(', ')}]`);
-    } else {
-      emit('SSH STOP', `ssh dedup: ${ours.detail}`);
-    }
-
-    enter('SOCKS_STARTING', `starting exactly ONE ssh tunnel -D ${cfg.socksHost}:${cfg.socksPort}`);
-    const spawnIt =
-      deps.spawnSshFn ??
-      ((c: RecoveryMachineConfig) => spawnSsh(c, spawnFn as SpawnFn));
-    const spawned = spawnIt(cfg);
-    emit('SSH START', spawned.detail);
-    if (!spawned.ok) {
-      enter('RECOVERY_FAILED', spawned.detail);
-      emit('RECOVERY FAILURE', spawned.detail);
-      return fail();
-    }
-    const probe = deps.checkPort ?? checkTcpPort;
-    const waited = await waitForPort(
-      async (h, p, t) => {
-        try {
-          return await probe(h, p, t);
-        } catch {
-          return false;
-        }
-      },
-      cfg.socksHost,
-      cfg.socksPort,
-      cfg.socksWaitMs,
-      750,
-      5000,
-      sleep,
-      now,
-    );
-    emit('SOCKS CHECK', waited.up ? `TCP ${cfg.socksHost}:${cfg.socksPort} opened after ${waited.waitedMs}ms (${waited.probes} probes)` : `TCP ${cfg.socksHost}:${cfg.socksPort} never opened in ${Math.round(waited.waitedMs / 1000)}s`);
-    if (!waited.up) {
-      enter('RECOVERY_FAILED', `ssh started (pid ${spawned.pid}) but :${cfg.socksPort} never opened`);
-      emit('RECOVERY FAILURE', `ssh started but SOCKS port never opened — never assuming ssh.exe means healthy`);
-      return fail();
-    }
-    enter('SOCKS_UP', `TCP ${cfg.socksHost}:${cfg.socksPort} listening`);
-  } else {
-    enter('SOCKS_UP', `TCP ${cfg.socksHost}:${cfg.socksPort} already listening — no ssh spawn`);
-  }
-
-  // -- D. SOCKS5 end-to-end through :1080 -----------------------------------
-  emit('SOCKS END-TO-END CHECK', `SOCKS5 CONNECT through ${cfg.socksHost}:${cfg.socksPort}, expecting egress ${cfg.expectedExternalIp}`);
-  const socksE2E = deps.socksE2E ?? ((h: string, p: number, t: number) => checkSocksEndToEnd(h, p, t));
-  let socksOk = false;
-  let lastSocksErr = '';
-  const runSocksE2E = async (): Promise<boolean> => {
-    for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
-      try {
-        const r = await socksE2E(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs);
-        egressViaSocks = r.ip;
-        const v = verifySocksEgressIp(r.ip, cfg.expectedExternalIp);
-        emit('SOCKS END-TO-END CHECK', `${v.detail} (via ${r.service}, ${r.elapsedMs}ms)`);
-        if (v.ok) {
-          return true;
-        }
-        lastSocksErr = v.detail;
-        // Wrong egress = tunnel forwards elsewhere; retrying the same ssh won't
-        // help — but a transient captive-portal HTML body might. One bounded
-        // retry, then fail honestly.
-        if (attempt < cfg.maxAttempts - 1) {
-          await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
-        }
-      } catch (e) {
-        lastSocksErr = (e as Error).message.slice(0, 200);
-        emit('SOCKS END-TO-END CHECK', `attempt ${attempt + 1} failed: ${lastSocksErr}`);
-        if (attempt < cfg.maxAttempts - 1) {
-          await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
-        }
-      }
-    }
-    return false;
-  };
-  socksOk = await runSocksE2E();
-  if (!socksOk && socksListening) {
-    // Stale-listener refresh (bounded, once): :1080 answered TCP but speaks
-    // no SOCKS — a dead tunnel squats the port (classic post-SG-block
-    // leftover). Refresh OWNED ssh only; a foreign listener is reported,
-    // never killed.
-    let ownerPid: number | null = null;
-    try {
-      ownerPid = deps.portOwner ? await deps.portOwner(cfg.socksPort) : await listenerPidForPort(exec, cfg.socksPort);
-    } catch {
-      ownerPid = null;
-    }
-    let owned: number[] = [];
-    try {
-      owned = (await listOurSsh(exec, cfg)).map((o) => o.pid);
-    } catch {
-      owned = [];
-    }
-    if (ownerPid !== null && !owned.includes(ownerPid)) {
-      emit('SSH STOP', `:${cfg.socksPort} held by non-owned pid ${ownerPid} with dead SOCKS — refusing to kill a foreign process (manual: schtasks /end or taskkill /PID ${ownerPid} /F)`);
-    } else if (owned.length === 0) {
-      emit('SSH STOP', `:${cfg.socksPort} listened but no owned ssh.exe found — cannot refresh safely`);
-    } else {
-      enter('SOCKS_DOWN', `stale owned tunnel squatting :${cfg.socksPort} — refreshing once`);
-      for (const pid of owned) {
-        const k = await killPid(exec, pid);
-        emit('SSH STOP', k.detail);
-      }
-      enter('SOCKS_STARTING', `starting exactly ONE fresh ssh tunnel -D ${cfg.socksHost}:${cfg.socksPort}`);
-      const spawnIt2 =
+      enter('SOCKS_STARTING', `starting exactly ONE ssh tunnel -D ${cfg.socksHost}:${cfg.socksPort}`);
+      const spawnIt =
         deps.spawnSshFn ??
         ((c: RecoveryMachineConfig) => spawnSsh(c, spawnFn as SpawnFn));
-      const spawned2 = spawnIt2(cfg);
-      emit('SSH START', spawned2.detail);
-      if (spawned2.ok) {
-        const probe = deps.checkPort ?? checkTcpPort;
-        const waited2 = await waitForPort(
-          async (h, p, t) => {
-            try {
-              return await probe(h, p, t);
-            } catch {
-              return false;
-            }
-          },
-          cfg.socksHost,
-          cfg.socksPort,
-          cfg.socksWaitMs,
-          750,
-          5000,
-          sleep,
-          now,
-        );
-        if (waited2.up) {
-          enter('SOCKS_UP', `fresh tunnel listening, re-verifying end-to-end`);
-          socksOk = await runSocksE2E();
-        } else {
-          lastSocksErr = `fresh ssh started (pid ${spawned2.pid}) but :${cfg.socksPort} never reopened`;
+      if (ours.kept) {
+        const stopped = await killPid(exec, ours.kept);
+        emit('SSH STOP', stopped.detail);
+        if (!stopped.ok) { enter('RECOVERY_FAILED', stopped.detail); return fail(); }
+      }
+      assertActive();
+      const spawned = spawnIt(cfg);
+      emit('SSH START', spawned.detail);
+      if (!spawned.ok) {
+        enter('RECOVERY_FAILED', spawned.detail);
+        emit('RECOVERY FAILURE', spawned.detail);
+        return fail();
+      }
+      const probe = deps.checkPort ?? checkTcpPort;
+      const waited = await waitForPort(
+        async (h, p, t) => {
+          try {
+            return await probe(h, p, t);
+          } catch {
+            return false;
+          }
+        },
+        cfg.socksHost,
+        cfg.socksPort,
+        cfg.socksWaitMs,
+        750,
+        5000,
+        sleep,
+        now,
+      );
+      emit('SOCKS CHECK', waited.up ? `TCP ${cfg.socksHost}:${cfg.socksPort} opened after ${waited.waitedMs}ms (${waited.probes} probes)` : `TCP ${cfg.socksHost}:${cfg.socksPort} never opened in ${Math.round(waited.waitedMs / 1000)}s`);
+      if (!waited.up) {
+        enter('RECOVERY_FAILED', `ssh started (pid ${spawned.pid}) but :${cfg.socksPort} never opened`);
+        emit('RECOVERY FAILURE', `ssh started but SOCKS port never opened — never assuming ssh.exe means healthy`);
+        return fail();
+      }
+      enter('SOCKS_UP', `TCP ${cfg.socksHost}:${cfg.socksPort} listening`);
+    } else {
+      enter('SOCKS_UP', `TCP ${cfg.socksHost}:${cfg.socksPort} already listening — no ssh spawn`);
+    }
+
+    // -- D. SOCKS5 end-to-end through :1080 -----------------------------------
+    emit('SOCKS END-TO-END CHECK', `SOCKS5 CONNECT through ${cfg.socksHost}:${cfg.socksPort}, expecting egress ${cfg.expectedExternalIp}`);
+    const socksE2E = deps.socksE2E ?? ((h: string, p: number, t: number) => checkSocksEndToEnd(h, p, t));
+    let socksOk = false;
+    let lastSocksErr = '';
+    const runSocksE2E = async (): Promise<boolean> => {
+      for (let attempt = 0; attempt < Math.max(1, cfg.maxAttempts); attempt++) {
+        assertActive();
+        try {
+          const r = await socksE2E(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs);
+          egressViaSocks = r.ip;
+          const v = verifySocksEgressIp(r.ip, cfg.expectedExternalIp);
+          emit('SOCKS END-TO-END CHECK', `${v.detail} (via ${r.service}, ${r.elapsedMs}ms)`);
+          if (v.ok) {
+            return true;
+          }
+          lastSocksErr = v.detail;
+          // Wrong egress = tunnel forwards elsewhere; retrying the same ssh won't
+          // help — but a transient captive-portal HTML body might. One bounded
+          // retry, then fail honestly.
+          if (attempt < cfg.maxAttempts - 1) {
+            await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
+          }
+        } catch (e) {
+          lastSocksErr = (e as Error).message.slice(0, 200);
+          emit('SOCKS END-TO-END CHECK', `attempt ${attempt + 1} failed: ${lastSocksErr}`);
+          if (attempt < cfg.maxAttempts - 1) {
+            await sleep(backoffMs(attempt, cfg.baseDelayMs, cfg.maxDelayMs));
+          }
         }
-      } else {
-        lastSocksErr = spawned2.detail;
+      }
+      return false;
+    };
+    socksOk = await runSocksE2E();
+    if (!socksOk && egressViaSocks && !verifySocksEgressIp(egressViaSocks, cfg.expectedExternalIp).ok) {
+      enter('RECOVERY_FAILED', lastSocksErr);
+      return fail();
+    }
+    const classify = deps.socksProbe ?? ((h: string, p: number, t: number) => probeSocksTunnel(h, p, t));
+    let classification: SocksProbeResult | null = null;
+    if (!socksOk) {
+      try { classification = await classify(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs); }
+      catch { classification = { connected: false, ip: null, service: null, detail: 'SOCKS probe failed' }; }
+      if (classification.ip && !verifySocksEgressIp(classification.ip, cfg.expectedExternalIp).ok) {
+        enter('RECOVERY_FAILED', `SOCKS egress ${classification.ip} != expected ${cfg.expectedExternalIp}`);
+        return fail();
       }
     }
-  }
-  if (!socksOk) {
-    // Final verdict requires classification (bug fix): the e2e loop can fail
-    // because the ECHO SERVICES are down while the tunnel itself forwards
-    // fine. Killing a working ssh over a diagnostic outage is forbidden.
-    const classify = deps.socksProbe ?? ((h: string, p: number, t: number) => probeSocksTunnel(h, p, t));
-    let classification: SocksProbeResult;
-    try {
-      classification = await classify(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs);
-    } catch (e) {
-      classification = { connected: false, ip: null, service: null, detail: (e as Error).message.slice(0, 200) };
+    if (!socksOk && socksListening && !classification?.connected) {
+      // Stale-listener refresh (bounded, once): :1080 answered TCP but speaks
+      // no SOCKS — a dead tunnel squats the port (classic post-SG-block
+      // leftover). Refresh OWNED ssh only; a foreign listener is reported,
+      // never killed.
+      let ownerPid: number | null = null;
+      try {
+        ownerPid = deps.portOwner ? await deps.portOwner(cfg.socksPort) : await listenerPidForPort(exec, cfg.socksPort);
+      } catch {
+        ownerPid = null;
+      }
+      let owned: number[] = [];
+      try {
+        owned = (await listOurSsh(exec, cfg)).map((o) => o.pid);
+      } catch {
+        owned = [];
+      }
+      if (ownerPid !== null && !owned.includes(ownerPid)) {
+        emit('SSH STOP', `:${cfg.socksPort} held by non-owned pid ${ownerPid} with dead SOCKS — refusing to kill a foreign process (manual: schtasks /end or taskkill /PID ${ownerPid} /F)`);
+      } else if (owned.length === 0) {
+        emit('SSH STOP', `:${cfg.socksPort} listened but no owned ssh.exe found — cannot refresh safely`);
+      } else {
+        enter('SOCKS_DOWN', `stale owned tunnel squatting :${cfg.socksPort} — refreshing once`);
+        for (const pid of owned) {
+          assertActive();
+          const k = await killPid(exec, pid);
+          emit('SSH STOP', k.detail);
+          if (!k.ok) { enter('RECOVERY_FAILED', k.detail); return fail(); }
+        }
+        enter('SOCKS_STARTING', `starting exactly ONE fresh ssh tunnel -D ${cfg.socksHost}:${cfg.socksPort}`);
+        const spawnIt2 =
+          deps.spawnSshFn ??
+          ((c: RecoveryMachineConfig) => spawnSsh(c, spawnFn as SpawnFn));
+        assertActive();
+        const spawned2 = spawnIt2(cfg);
+        emit('SSH START', spawned2.detail);
+        if (spawned2.ok) {
+          const probe = deps.checkPort ?? checkTcpPort;
+          const waited2 = await waitForPort(
+            async (h, p, t) => {
+              try {
+                return await probe(h, p, t);
+              } catch {
+                return false;
+              }
+            },
+            cfg.socksHost,
+            cfg.socksPort,
+            cfg.socksWaitMs,
+            750,
+            5000,
+            sleep,
+            now,
+          );
+          if (waited2.up) {
+            enter('SOCKS_UP', `fresh tunnel listening, re-verifying end-to-end`);
+            socksOk = await runSocksE2E();
+          } else {
+            lastSocksErr = `fresh ssh started (pid ${spawned2.pid}) but :${cfg.socksPort} never reopened`;
+          }
+        } else {
+          lastSocksErr = spawned2.detail;
+        }
+      }
     }
-    if (classification.connected) {
-      // Connectivity proven; identity is still enforced in step G via the HTTP
-      // path (echo down there is tolerated, a WRONG ip there still fails).
-      enter('SOCKS_UP', `tunnel connectivity proven (SOCKS5 CONNECT ok); egress IP unverified (echo unavailable)`);
-      egressViaSocks = classification.ip;
-      emit('SOCKS END-TO-END CHECK', `connectivity-only pass: ${classification.detail}`);
+    if (!socksOk) {
+      // Final verdict requires classification (bug fix): the e2e loop can fail
+      // because the ECHO SERVICES are down while the tunnel itself forwards
+      // fine. Killing a working ssh over a diagnostic outage is forbidden.
+      if (!classification?.connected) {
+        try { classification = await classify(cfg.socksHost, cfg.socksPort, cfg.checkTimeoutMs); }
+        catch (e) { classification = { connected: false, ip: null, service: null, detail: (e as Error).message }; }
+      }
+      if (classification.ip && !verifySocksEgressIp(classification.ip, cfg.expectedExternalIp).ok) {
+        enter('RECOVERY_FAILED', `SOCKS egress ${classification.ip} != expected ${cfg.expectedExternalIp}`);
+        return fail();
+      }
+      if (classification.connected) {
+        // Connectivity proven; identity is still enforced in step G via the HTTP
+        // path (echo down there is tolerated, a WRONG ip there still fails).
+        enter('SOCKS_UP', `tunnel connectivity proven (SOCKS5 CONNECT ok); egress IP unverified (echo unavailable)`);
+        egressViaSocks = classification.ip;
+        emit('SOCKS END-TO-END CHECK', `connectivity-only pass: ${classification.detail}`);
+      } else {
+        const detail = `SOCKS end-to-end failed: ${lastSocksErr || classification.detail}`;
+        enter('RECOVERY_FAILED', detail);
+        emit('RECOVERY FAILURE', detail);
+        return fail();
+      }
+    }
+
+    // -- E/F. Single-owner hpts on :8080 (only after SOCKS healthy) ----------
+    const httpListening = await safeCheck(cfg.socksHost === '127.0.0.1' ? '127.0.0.1' : cfg.socksHost, cfg.httpPort, cfg.checkTimeoutMs);
+    emit('HTTP PROXY CHECK', `TCP 127.0.0.1:${cfg.httpPort} ${httpListening ? 'listening' : 'refused'}`);
+    if (!httpListening) {
+      enter('HTTP_PROXY_DOWN', `TCP 127.0.0.1:${cfg.httpPort} refused (SOCKS healthy — bridge only)`);
+      const hpts = await (async () => {
+        try {
+          if (deps.listHpts) {
+            return await deps.listHpts(cfg);
+          }
+          const owner = await listenerPidForPort(exec, cfg.httpPort);
+          return await dedupOurHpts(exec, cfg, owner);
+        } catch (e) {
+          return { kept: null, killed: [], detail: `hpts dedup probe failed: ${(e as Error).message.slice(0, 160)}` };
+        }
+      })();
+      emit('HTTP BRIDGE START', `hpts dedup: ${hpts.detail}`);
+      enter('HTTP_PROXY_STARTING', `starting exactly ONE hpts -p ${cfg.httpPort}`);
+      const spawnH = deps.spawnHptsFn ?? ((c: RecoveryMachineConfig) => spawnHpts(c, spawnFn as SpawnFn));
+      if (hpts.kept) {
+        const stopped = await killPid(exec, hpts.kept);
+        emit('HTTP BRIDGE START', stopped.detail);
+        if (!stopped.ok) { enter('RECOVERY_FAILED', stopped.detail); return fail(); }
+      }
+      assertActive();
+      const spawnedH = spawnH(cfg);
+      emit('HTTP BRIDGE START', spawnedH.detail);
+      if (!spawnedH.ok) {
+        enter('RECOVERY_FAILED', spawnedH.detail);
+        emit('RECOVERY FAILURE', spawnedH.detail);
+        return fail();
+      }
+      const probe = deps.checkPort ?? checkTcpPort;
+      const waited = await waitForPort(
+        async (h, p, t) => {
+          try {
+            return await probe(h, p, t);
+          } catch {
+            return false;
+          }
+        },
+        '127.0.0.1',
+        cfg.httpPort,
+        cfg.httpWaitMs,
+        750,
+        5000,
+        sleep,
+        now,
+      );
+      emit('HTTP PROXY CHECK', waited.up ? `TCP 127.0.0.1:${cfg.httpPort} opened after ${waited.waitedMs}ms` : `TCP 127.0.0.1:${cfg.httpPort} never opened`);
+      if (!waited.up) {
+        enter('RECOVERY_FAILED', `hpts started (pid ${spawnedH.pid}) but :${cfg.httpPort} never opened`);
+        emit('RECOVERY FAILURE', `hpts started but HTTP port never opened`);
+        return fail();
+      }
+      enter('HTTP_PROXY_UP', `TCP 127.0.0.1:${cfg.httpPort} listening`);
     } else {
-      const detail = `SOCKS end-to-end failed: ${lastSocksErr || classification.detail}`;
+      enter('HTTP_PROXY_UP', `TCP 127.0.0.1:${cfg.httpPort} already listening — bridge left alone`);
+    }
+
+    // -- G. HTTP proxy path end-to-end ----------------------------------------
+    // Two-stage verification (bug fix: the old code compared the IP echoed by
+    // api.ipify.org/checkip and declared RECOVERY_FAILED on any echo-service
+    // outage — a diagnostic-service failure masquerading as an infrastructure
+    // failure, the exact false-positive class this design forbids elsewhere).
+    //
+    //   Stage 1 (must pass): a lightweight transport probe through :8080
+    //     (gstatic generate_204 — stable, never an echo service, never Zen).
+    //     Failure here IS an infrastructure failure -> RECOVERY_FAILED.
+    //   Stage 2 (evidence, not a verdict): observe egress via IP-echo through
+    //     the bridge. A mismatch with the expected Elastic IP is still fatal
+    //     (traffic demonstrably leaves elsewhere), but when every echo service
+    //     is unreachable we report READY with "egress unverified" — matching the
+    //     layered health-check philosophy that echo services must never sink
+    //     an otherwise proven transport.
+    emit('HTTP PROXY CHECK', `verifying HTTP proxy path via 127.0.0.1:${cfg.httpPort} (transport probe, then egress evidence)`);
+    const { probeProxyTransport, DEFAULT_TRANSPORT_PROBE_URL } = await import('./health');
+    const transportUrl = cfg.transportProbeUrl?.trim() || DEFAULT_TRANSPORT_PROBE_URL;
+    const transportTimeout = Math.min(cfg.transportProbeTimeoutMs ?? cfg.checkTimeoutMs, cfg.checkTimeoutMs + 4000);
+    const probeHttp = () => deps.probeTransport
+      ? deps.probeTransport(transportUrl, transportTimeout)
+      : probeProxyTransport('127.0.0.1', cfg.httpPort, transportUrl, transportTimeout);
+    let transport = await probeHttp();
+    if (!transport.ok && httpListening) {
+      const owner = deps.portOwner ? await deps.portOwner(cfg.httpPort) : await listenerPidForPort(exec, cfg.httpPort);
+      const bridges = await listOurHpts(exec, cfg);
+      if (owner !== null && bridges.some((p) => p.pid === owner)) {
+        enter('HTTP_PROXY_DOWN', 'owned bridge listens but cannot forward; refreshing once');
+        for (const bridge of bridges) {
+          assertActive();
+          const stopped = await killPid(exec, bridge.pid);
+          emit('HTTP BRIDGE START', stopped.detail);
+          if (!stopped.ok) { enter('RECOVERY_FAILED', stopped.detail); return fail(); }
+        }
+        enter('HTTP_PROXY_STARTING', 'starting a fresh HTTP bridge');
+        assertActive();
+        const restarted = (deps.spawnHptsFn ?? ((c) => spawnHpts(c, spawnFn)))(cfg);
+        if (!restarted.ok) { enter('RECOVERY_FAILED', restarted.detail); return fail(); }
+        const waited = await waitForPort(safeCheck, '127.0.0.1', cfg.httpPort, cfg.httpWaitMs, 750, 5000, sleep, now);
+        if (waited.up) transport = await probeHttp();
+      }
+    }
+    emit('HTTP PROXY CHECK', transport.detail);
+    if (!transport.ok) {
+      const detail = `HTTP bridge transport probe failed: ${transport.detail}`;
       enter('RECOVERY_FAILED', detail);
       emit('RECOVERY FAILURE', detail);
       return fail();
     }
-  }
 
-  // -- E/F. Single-owner hpts on :8080 (only after SOCKS healthy) ----------
-  const httpListening = await safeCheck(cfg.socksHost === '127.0.0.1' ? '127.0.0.1' : cfg.socksHost, cfg.httpPort, cfg.checkTimeoutMs);
-  emit('HTTP PROXY CHECK', `TCP 127.0.0.1:${cfg.httpPort} ${httpListening ? 'listening' : 'refused'}`);
-  if (!httpListening) {
-    enter('HTTP_PROXY_DOWN', `TCP 127.0.0.1:${cfg.httpPort} refused (SOCKS healthy — bridge only)`);
-    const hpts = await (async () => {
-      try {
-        if (deps.listHpts) {
-          return await deps.listHpts(cfg);
-        }
-        const owner = await listenerPidForPort(exec, cfg.httpPort);
-        return await dedupOurHpts(exec, cfg, owner);
-      } catch (e) {
-        return { kept: null, killed: [], detail: `hpts dedup probe failed: ${(e as Error).message.slice(0, 160)}` };
+    const httpEgress = deps.httpEgress ?? (async () => {
+      const { fetchTrafficIpFromServices, fetchViaHttpProxy, IP_CHECK_URLS } = await import('./health');
+      const reading = await fetchTrafficIpFromServices(
+        fetchViaHttpProxy,
+        '127.0.0.1',
+        cfg.httpPort,
+        ['http://api.ipify.org/', ...IP_CHECK_URLS.filter((u) => u !== 'http://api.ipify.org/')],
+        cfg.checkTimeoutMs,
+      );
+      return reading.ip;
+    });
+    try {
+      const ip = (await httpEgress()).trim();
+      egressViaHttp = ip;
+      emit('HTTP PROXY CHECK', `HTTP proxy egress ${ip}`);
+      if (cfg.expectedExternalIp && ip !== cfg.expectedExternalIp) {
+        enter('RECOVERY_FAILED', `HTTP egress ${ip} != expected ${cfg.expectedExternalIp} — NOT leaving via EC2`);
+        emit('RECOVERY FAILURE', `HTTP egress mismatch`);
+        return fail();
       }
-    })();
-    emit('HTTP BRIDGE START', `hpts dedup: ${hpts.detail}`);
-    enter('HTTP_PROXY_STARTING', `starting exactly ONE hpts -p ${cfg.httpPort}`);
-    const spawnH = deps.spawnHptsFn ?? ((c: RecoveryMachineConfig) => spawnHpts(c, spawnFn as SpawnFn));
-    const spawnedH = spawnH(cfg);
-    emit('HTTP BRIDGE START', spawnedH.detail);
-    if (!spawnedH.ok) {
-      enter('RECOVERY_FAILED', spawnedH.detail);
-      emit('RECOVERY FAILURE', spawnedH.detail);
-      return fail();
+    } catch (e) {
+      // Echo services down (or all answered non-IP bodies). The transport was
+      // just proven end-to-end in stage 1; do NOT fail recovery on a diagnostic
+      // service outage. The next regular health cycle re-verifies.
+      const detail = (e as Error).message.slice(0, 200);
+      egressViaHttp = null;
+      egressVerified = false;
+      emit('HTTP PROXY CHECK', `egress IP unverified (echo services unavailable): ${detail}`);
     }
-    const probe = deps.checkPort ?? checkTcpPort;
-    const waited = await waitForPort(
-      async (h, p, t) => {
-        try {
-          return await probe(h, p, t);
-        } catch {
-          return false;
-        }
-      },
-      '127.0.0.1',
-      cfg.httpPort,
-      cfg.httpWaitMs,
-      750,
-      5000,
-      sleep,
-      now,
-    );
-    emit('HTTP PROXY CHECK', waited.up ? `TCP 127.0.0.1:${cfg.httpPort} opened after ${waited.waitedMs}ms` : `TCP 127.0.0.1:${cfg.httpPort} never opened`);
-    if (!waited.up) {
-      enter('RECOVERY_FAILED', `hpts started (pid ${spawnedH.pid}) but :${cfg.httpPort} never opened`);
-      emit('RECOVERY FAILURE', `hpts started but HTTP port never opened`);
-      return fail();
-    }
-    enter('HTTP_PROXY_UP', `TCP 127.0.0.1:${cfg.httpPort} listening`);
-  } else {
-    enter('HTTP_PROXY_UP', `TCP 127.0.0.1:${cfg.httpPort} already listening — bridge left alone`);
-  }
 
-  // -- G. HTTP proxy path end-to-end ----------------------------------------
-  // Two-stage verification (bug fix: the old code compared the IP echoed by
-  // api.ipify.org/checkip and declared RECOVERY_FAILED on any echo-service
-  // outage — a diagnostic-service failure masquerading as an infrastructure
-  // failure, the exact false-positive class this design forbids elsewhere).
-  //
-  //   Stage 1 (must pass): a lightweight transport probe through :8080
-  //     (gstatic generate_204 — stable, never an echo service, never Zen).
-  //     Failure here IS an infrastructure failure -> RECOVERY_FAILED.
-  //   Stage 2 (evidence, not a verdict): observe egress via IP-echo through
-  //     the bridge. A mismatch with the expected Elastic IP is still fatal
-  //     (traffic demonstrably leaves elsewhere), but when every echo service
-  //     is unreachable we report READY with "egress unverified" — matching the
-  //     layered health-check philosophy that echo services must never sink
-  //     an otherwise proven transport.
-  emit('HTTP PROXY CHECK', `verifying HTTP proxy path via 127.0.0.1:${cfg.httpPort} (transport probe, then egress evidence)`);
-  const { probeProxyTransport, DEFAULT_TRANSPORT_PROBE_URL } = await import('./health');
-  const transportUrl = cfg.transportProbeUrl?.trim() || DEFAULT_TRANSPORT_PROBE_URL;
-  const transportTimeout = Math.min(cfg.transportProbeTimeoutMs ?? cfg.checkTimeoutMs, cfg.checkTimeoutMs + 4000);
-  const transport = deps.probeTransport
-    ? await deps.probeTransport(transportUrl, transportTimeout)
-    : await probeProxyTransport('127.0.0.1', cfg.httpPort, transportUrl, transportTimeout);
-  emit('HTTP PROXY CHECK', transport.detail);
-  if (!transport.ok) {
-    const detail = `HTTP bridge transport probe failed: ${transport.detail}`;
-    enter('RECOVERY_FAILED', detail);
+    // -- H. READY ---------------------------------------------------------------
+    const egressNote = egressVerified ? `egress via SOCKS ${egressViaSocks ?? '?'} / via HTTP ${egressViaHttp ?? '?'}` : `egress via SOCKS ${egressViaSocks ?? '?'} / HTTP egress unverified (echo services down; transport proven)`;
+    enter('READY', egressNote);
+    emit(
+      'RECOVERY SUCCESS',
+      egressVerified
+        ? `proxy READY — SOCKS :${cfg.socksPort} + HTTP :${cfg.httpPort} verified end-to-end`
+        : `proxy READY — transport verified end-to-end; egress IP unverified (echo services unavailable)`,
+    );
+    return {
+      ok: true,
+      state: 'READY',
+      path,
+      logs,
+      egressViaSocks,
+      egressViaHttp,
+      egressVerified,
+      publicIpDirect,
+      sgRepaired,
+      elapsedMs: now() - started,
+    };
+  } catch (e) {
+    const detail = (e as Error).message;
+    path.push('RECOVERY_FAILED');
     emit('RECOVERY FAILURE', detail);
     return fail();
   }
-
-  const httpEgress = deps.httpEgress ?? (async () => {
-    const { fetchTrafficIpFromServices, fetchViaHttpProxy, IP_CHECK_URLS } = await import('./health');
-    const reading = await fetchTrafficIpFromServices(
-      fetchViaHttpProxy,
-      '127.0.0.1',
-      cfg.httpPort,
-      ['http://api.ipify.org/', ...IP_CHECK_URLS.filter((u) => u !== 'http://api.ipify.org/')],
-      cfg.checkTimeoutMs,
-    );
-    return reading.ip;
-  });
-  try {
-    const ip = (await httpEgress()).trim();
-    egressViaHttp = ip;
-    emit('HTTP PROXY CHECK', `HTTP proxy egress ${ip}`);
-    if (cfg.expectedExternalIp && ip !== cfg.expectedExternalIp) {
-      enter('RECOVERY_FAILED', `HTTP egress ${ip} != expected ${cfg.expectedExternalIp} — NOT leaving via EC2`);
-      emit('RECOVERY FAILURE', `HTTP egress mismatch`);
-      return fail();
-    }
-  } catch (e) {
-    // Echo services down (or all answered non-IP bodies). The transport was
-    // just proven end-to-end in stage 1; do NOT fail recovery on a diagnostic
-    // service outage. The next regular health cycle re-verifies.
-    const detail = (e as Error).message.slice(0, 200);
-    egressViaHttp = null;
-    egressVerified = false;
-    emit('HTTP PROXY CHECK', `egress IP unverified (echo services unavailable): ${detail}`);
-  }
-
-  // -- H. READY ---------------------------------------------------------------
-  const egressNote = egressVerified ? `egress via SOCKS ${egressViaSocks ?? '?'} / via HTTP ${egressViaHttp ?? '?'}` : `egress via SOCKS ${egressViaSocks ?? '?'} / HTTP egress unverified (echo services down; transport proven)`;
-  enter('READY', egressNote);
-  emit(
-    'RECOVERY SUCCESS',
-    egressVerified
-      ? `proxy READY — SOCKS :${cfg.socksPort} + HTTP :${cfg.httpPort} verified end-to-end`
-      : `proxy READY — transport verified end-to-end; egress IP unverified (echo services unavailable)`,
-  );
-  return {
-    ok: true,
-    state: 'READY',
-    path,
-    logs,
-    egressViaSocks,
-    egressViaHttp,
-    egressVerified,
-    publicIpDirect,
-    sgRepaired,
-    elapsedMs: now() - started,
-  };
 
   function fail(): RecoveryOutcome {
     return {

@@ -97,6 +97,8 @@ import {
   isRecoveryRunning,
   recoverProxy,
 } from './recoveryMachine';
+import { ProxyLifecycle } from './lifecycle';
+import { shutdownProxy } from './shutdown';
 import { DEFAULT_PROC_CONFIG } from './procOwn';
 import { DEFAULT_AWSNET_CONFIG, DIRECT_IP_URLS, checkAwsSshReachable, ensureSshAccess, fetchDirectPublicIp, fetchDirectUrl } from './awsNet';
 import { queryScheduledTask } from './recover';
@@ -104,6 +106,9 @@ import { AWS_ELASTIC_IP, AWS_REGION } from './netModel';
 
 const CHANNEL_NAME = 'OpenCode Proxy Health';
 const HISTORY_KEY = 'history.v1';
+const ENABLED_KEY = 'proxy.enabled.v1';
+const STOP_ERROR_KEY = 'proxy.shutdownIncomplete.v1';
+const TASKS_KEY = 'proxy.disabledTasks.v1';
 const MAX_TRACK_FILES = 200;
 /** Wrapper-PID liveness cache: a long request must not cost a tasklist spawn per tick. */
 const PID_CACHE_TTL_MS = 30_000;
@@ -336,7 +341,12 @@ function stamp(): string {
   return new Date().toLocaleTimeString();
 }
 
-class Monitor {
+export class Monitor {
+  private lifecycle: ProxyLifecycle;
+  private powerWork: Promise<void> = Promise.resolve();
+  private powerGeneration = 0;
+  private shutdownIncomplete = false;
+  private proxiedTerminals = new Set<vscode.Terminal>();
   private item: vscode.StatusBarItem;
   private channel: vscode.OutputChannel;
   private timer: NodeJS.Timeout | null = null;
@@ -356,6 +366,7 @@ class Monitor {
   private deep: DeepInfo = emptyDeep();
   private deepFor: DisplayState | null = null;
   private wasSlow = false;
+  private logWrites: Promise<void> = Promise.resolve();
   private lastWarnSig = '';
   private pidCache = new Map<number, { alive: boolean; at: number }>();
   private recoverAttempts: RecoverAttempt[] = [];
@@ -398,6 +409,8 @@ class Monitor {
     private context: vscode.ExtensionContext,
     output: vscode.OutputChannel,
   ) {
+    this.lifecycle = new ProxyLifecycle(context.globalState.get<boolean>(ENABLED_KEY, true));
+    this.shutdownIncomplete = context.globalState.get<boolean>(STOP_ERROR_KEY, false);
     this.channel = output;
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this.item.name = 'OpenCode Proxy Health';
@@ -416,6 +429,10 @@ class Monitor {
     this.stop();
     const { cfg, warnings } = readExtConfig();
     this.cfg = cfg;
+    if (!this.lifecycle.enabled) {
+      this.applyView(presentDisplay('OFF'), 'OFF');
+      return;
+    }
     const sig = warnings.join('|');
     if (sig !== this.lastWarnSig) {
       this.lastWarnSig = sig;
@@ -500,10 +517,104 @@ class Monitor {
   }
 
   dispose(): void {
+    this.lifecycle.enabled = false;
     this.stop();
     if (this.wakeHook) {
       this.wakeHook.dispose();
       this.wakeHook = null;
+    }
+  }
+
+  private proxyExec = (file: string, args: string[], timeout: number): Promise<string> => {
+    if (!this.lifecycle.enabled) return Promise.reject(new Error('Proxy is turned off'));
+    return defaultExecAsync(file, args, timeout);
+  };
+
+  turnOff(): Promise<void> {
+    ++this.powerGeneration;
+    this.lifecycle.enabled = false;
+    this.shutdownIncomplete = true;
+    this.stop();
+    this.applyView(presentDisplay('OFF'), 'OFF');
+    this.powerWork = this.powerWork.then(() => this.turnOffInner(), () => this.turnOffInner());
+    return this.powerWork;
+  }
+
+  private async turnOffInner(): Promise<void> {
+    this.lifecycle.enabled = false;
+    this.shutdownIncomplete = true;
+    this.stop();
+    this.applyView(presentDisplay('OFF'), 'OFF');
+    try {
+      await this.context.globalState.update(ENABLED_KEY, false);
+      await this.context.globalState.update(STOP_ERROR_KEY, true);
+      await this.lifecycle.drain();
+      if (this.currentCheck) await this.currentCheck;
+      for (const terminal of this.proxiedTerminals) terminal.dispose();
+      this.proxiedTerminals.clear();
+      const tasks = this.context.globalState.get<string[]>(TASKS_KEY, []);
+      const result = await shutdownProxy(defaultExecAsync, {
+        ...this.recoveryMachineConfig(), sshTaskName: this.cfg.sshTaskName, bridgeTaskName: this.cfg.bridgeTaskName,
+      }, async (name) => {
+        if (!tasks.includes(name)) tasks.push(name);
+        await this.context.globalState.update(TASKS_KEY, tasks);
+      });
+      this.shutdownIncomplete = !result.ok;
+      await this.context.globalState.update(STOP_ERROR_KEY, this.shutdownIncomplete);
+      this.policy = emptyPolicy();
+      this.downSince = null;
+      this.recoveryEpisodeOutage = false;
+      updateHistory(this.history, true, Date.now());
+      await this.context.globalState.update(HISTORY_KEY, this.history);
+      this.lastResult = null;
+      for (const detail of result.details) this.emit(`[${stamp()}] [STOP] ${detail}`);
+      if (result.ok) void vscode.window.showInformationMessage('Proxy is off and will stay off until you turn it on. Clear proxy settings in any other apps or existing terminals before using them directly.');
+      else void vscode.window.showErrorMessage('Recovery is paused, but proxy shutdown could not be fully verified. See the output log; retry Turn Proxy Off after resolving the errors.');
+    } catch (e) {
+      this.shutdownIncomplete = true;
+      this.emit(`[${stamp()}] [STOP] Shutdown failed: ${(e as Error).message}`);
+      void vscode.window.showErrorMessage(`Proxy shutdown incomplete: ${(e as Error).message}`);
+    } finally {
+      this.applyView(presentDisplay('OFF'), 'OFF');
+    }
+  }
+
+  turnOn(): Promise<void> {
+    const generation = ++this.powerGeneration;
+    const start = () => this.turnOnInner(generation);
+    this.powerWork = this.powerWork.then(start, start);
+    return this.powerWork;
+  }
+
+  private async turnOnInner(generation: number): Promise<void> {
+    if (generation !== this.powerGeneration || this.lifecycle.enabled) return;
+    try {
+      // Restore only tasks this extension disabled, and only in task mode.
+      if (this.cfg.supervisorMode === 'task') {
+        const pending = this.context.globalState.get<string[]>(TASKS_KEY, []);
+        while (pending.length) {
+          await defaultExecAsync('schtasks', ['/change', '/TN', pending[0], '/ENABLE'], 10000);
+          pending.shift();
+          await this.context.globalState.update(TASKS_KEY, pending);
+        }
+      }
+      if (generation !== this.powerGeneration) return;
+      await this.context.globalState.update(ENABLED_KEY, true);
+      if (generation !== this.powerGeneration) return;
+      this.lifecycle.enabled = true;
+      this.shutdownIncomplete = false;
+      this.bootstrapDone = false;
+      this.baseState = 'STARTING';
+      this.policy = emptyPolicy();
+      this.cadence = emptyRecoveryCadence();
+      this.recoveryFailNotified = false;
+      this.zen = emptyZen();
+      this.lastZenProbeAt = 0;
+      this.start();
+      if (this.cfg.supervisorMode === 'task') await this.recoverChain();
+      else await this.runDirectRecovery('manual-command');
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Could not turn proxy on: ${(e as Error).message}`);
     }
   }
 
@@ -519,7 +630,11 @@ class Monitor {
       iconPath: new vscode.ThemeIcon('refresh'),
       tooltip: `Start "${task}" now`,
     });
-    const items: Item[] = [];
+    const items: Item[] = [{
+      label: this.lifecycle.enabled ? '$(debug-stop) Turn proxy off safely' : '$(play) Turn proxy on',
+      detail: this.lifecycle.enabled ? 'Stops proxy processes and retry tasks; stays off across VS Code restarts. Closes terminals launched by this extension.' : 'Resume monitoring and recovery. Other terminals may need their proxy environment cleared.',
+      action: this.lifecycle.enabled ? 'off' : 'on',
+    }];
     const r = this.lastResult;
     const ago = this.lastCheck ? `${Math.max(0, Math.round((Date.now() - this.lastCheck.getTime()) / 1000))}s ago` : 'never';
     const ms = (v: number | null) => (v === null ? '—' : `${v}ms`);
@@ -632,7 +747,7 @@ class Monitor {
         items.push({ label: '$(info) Reason', detail: r.reason });
       }
     } else {
-      items.push({ label: '$(sync~spin) No check has completed yet', detail: 'wait a few seconds and reopen' });
+      items.push({ label: this.lifecycle.enabled ? '$(sync~spin) No check has completed yet' : '$(debug-stop) Proxy is OFF', detail: this.lifecycle.enabled ? 'wait a few seconds and reopen' : 'Monitoring, startup recovery and network repair are paused.' });
       items.push({ label: '$(rocket) One-click recovery — run the full runbook', action: 'recover' });
     }
     items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
@@ -700,7 +815,11 @@ class Monitor {
     if (!pick?.action) {
       return;
     }
-    if (pick.action === 'recover' || pick.action === 'recover-direct') {
+    if (pick.action === 'off') {
+      await this.turnOff();
+    } else if (pick.action === 'on') {
+      await this.turnOn();
+    } else if (pick.action === 'recover' || pick.action === 'recover-direct') {
       if (this.cfg.supervisorMode === 'direct') {
         await this.runDirectRecovery('dashboard');
       } else {
@@ -836,7 +955,7 @@ class Monitor {
 
   private emit(line: string): void {
     this.channel.appendLine(line);
-    void this.appendFileLog(line);
+    this.logWrites = this.logWrites.then(() => this.appendFileLog(line));
   }
 
   private logFileUri(): vscode.Uri {
@@ -871,6 +990,12 @@ class Monitor {
     view: ReturnType<typeof presentDisplay>,
     state: DisplayState,
   ): void {
+    if (!this.lifecycle.enabled) {
+      view = presentDisplay('OFF');
+      if (this.shutdownIncomplete) view = { ...view, icon: '$(alert)', text: 'Proxy: OFF (shutdown incomplete)', level: 'warning', accessLabel: 'Proxy recovery paused; shutdown incomplete. Retry Turn Proxy Off.' };
+      state = 'OFF';
+      this.display = 'OFF';
+    }
     this.item.text = barText(view, this.cfg.statusStyle);
     // Deliberately no severity background tint: state is carried by the glyph
     // shape, the tooltip, and the accessibility label — never by color.
@@ -894,6 +1019,10 @@ class Monitor {
     md.supportHtml = false;
     md.supportThemeIcons = true;
     md.appendMarkdown('**OpenCode Proxy Health**\n\n');
+    if (!this.lifecycle.enabled) {
+      md.appendMarkdown(this.shutdownIncomplete ? '**Recovery paused; shutdown incomplete.** See the output log and retry Turn Proxy Off.\n\n' : '**Proxy is off.** Startup recovery and network repair are paused. Use Turn Proxy On to resume.\n\n');
+      return md;
+    }
     md.appendMarkdown(`State: ${view.icon} \`${state}\` — ${view.accessLabel}\n\n`);
     if (r && !this.cfg.compactTooltip) {
       const ms = (v: number | null) => (v === null ? '—' : `${v}ms`);
@@ -1082,15 +1211,14 @@ class Monitor {
   private async reviveTask(task: string, rc: RecoverConfig, verb: string): Promise<{ ok: boolean; detail: string }> {
     const watch = this.portForTask(task, rc);
     return reviveScheduledTask(task, watch, verb !== 'Auto-recovery' || this.cfg.autoRecoverResetStuckTask, this.cfg.runbookPortWaitSec * 1000, {
-      exec: defaultExecAsync,
+      exec: this.proxyExec,
       probe: checkTcpPort,
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      sleep: (ms) => this.lifecycle.sleep(ms),
       now: () => Date.now(),
       onProgress: (detail) => this.emit(`[${stamp()}] [FIX] ${verb}: ${detail}.`),
-      canStart: verb === 'Auto-recovery' ? () => this.cfg.autoRecover && !this.cfg.autoRecoverDryRun : undefined,
-      canReset: verb === 'Auto-recovery'
-        ? () => this.cfg.autoRecover && this.cfg.autoRecoverResetStuckTask && !this.cfg.autoRecoverDryRun
-        : undefined,
+      canContinue: () => this.lifecycle.enabled,
+      canStart: () => this.lifecycle.enabled && (verb !== 'Auto-recovery' || (this.cfg.autoRecover && !this.cfg.autoRecoverDryRun)),
+      canReset: () => this.lifecycle.enabled && (verb !== 'Auto-recovery' || (this.cfg.autoRecover && this.cfg.autoRecoverResetStuckTask && !this.cfg.autoRecoverDryRun)),
     });
   }
 
@@ -1099,6 +1227,7 @@ class Monitor {
    * failure. Remote failures get no automatic task action.
    */
   private async maybeRecover(): Promise<void> {
+    if (!this.lifecycle.enabled || !this.cfg.autoRecover) return;
     if (this.runbookRunning || this.autoRecoveryRunning || this.manualRecoveryRunning || this.directRecoveryRunning) {
       return;
     }
@@ -1241,6 +1370,14 @@ class Monitor {
    * single-flight, never requires OpenCode or a healthy proxy. Never throws.
    */
   async runDirectRecovery(reason: string): Promise<void> {
+    await this.lifecycle.run(() => this.runDirectRecoveryInner(reason));
+  }
+
+  private async runDirectRecoveryInner(reason: string): Promise<void> {
+    if (this.cfg.supervisorMode !== 'direct') {
+      await this.recoverChain();
+      return;
+    }
     if (this.directRecoveryRunning || isRecoveryRunning() || this.runbookRunning) {
       this.emit(`[${stamp()}] Direct recovery (${reason}) skipped — another recovery is already running (idempotent).`);
       return;
@@ -1250,6 +1387,7 @@ class Monitor {
       return;
     }
     this.directRecoveryRunning = true;
+    this.cadence = { ...this.cadence, lastAttemptMs: Date.now() };
     this.emit(`[${stamp()}] ── Direct recovery started (${reason}, supervisor=direct) ──`);
     // A recovery run counts as confirmation for outage math: seed the outage
     // clock so a genuinely long repair notifies exactly once on success.
@@ -1268,8 +1406,10 @@ class Monitor {
     try {
       const outcome = await recoverProxy(
         rcfg,
-        defaultExecAsync,
+        this.proxyExec,
         {
+          canContinue: () => this.lifecycle.enabled,
+          sleep: (ms) => this.lifecycle.sleep(ms),
           onState: (s, detail) => {
             this.recoveryState = s;
             const disp = this.recoveryDisplayFor(s);
@@ -1279,6 +1419,7 @@ class Monitor {
           },
         },
       );
+      if (!this.lifecycle.enabled) return;
       for (const l of outcome.logs) {
         this.emit(`[${l.at}] [${l.tag}] ${l.message}`);
       }
@@ -1290,14 +1431,17 @@ class Monitor {
         this.emit(`[${stamp()}] [RECOVERY SUCCESS] Direct recovery READY in ${outcome.elapsedMs}ms — SOCKS :${rcfg.socksPort} + HTTP :${rcfg.httpPort} verified end-to-end.`);
         // Success notification is owned by the post-recovery health check:
         // only a confirmed outage lasting >= minOutageNotifySec notifies.
-        await this.check(true);
+        // Called from checkInner -> maybeRecover: awaiting the current check
+        // here would await ourselves forever. Queue the refresh without joining it.
+        if (this.running) void this.check(true);
+        else await this.check(true);
         if (outcome.publicIpDirect) {
           this.lastPublicIp = outcome.publicIpDirect;
           this.lastPublicIpAt = Date.now();
         }
         void this.checkSchedulerConflict();
       } else {
-        this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1 };
+        this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
         this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery FAILED (${outcome.state}): path ${outcome.path.join(' -> ')}.`);
         this.display = 'RECOVERY_FAILED';
         this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
@@ -1310,6 +1454,8 @@ class Monitor {
         }
       }
     } catch (e) {
+      if (!this.lifecycle.enabled) return;
+      this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
       this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery threw: ${(e as Error).message}`);
       this.display = 'RECOVERY_FAILED';
       this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
@@ -1326,7 +1472,7 @@ class Monitor {
 
   /** Startup bootstrap: health-check first; if unhealthy, enter recovery once. */
   private async maybeBootstrap(): Promise<void> {
-    if (this.bootstrapDone) {
+    if (!this.lifecycle.enabled || this.bootstrapDone) {
       return;
     }
     this.bootstrapDone = true;
@@ -1349,6 +1495,10 @@ class Monitor {
    * On a detected change: mark RECONNECTING (not failed), verify, recover.
    */
   private async pollPublicIpOnce(force = false): Promise<void> {
+    await this.lifecycle.run(() => this.pollPublicIpOnceInner(force));
+  }
+
+  private async pollPublicIpOnceInner(force = false): Promise<void> {
     if (!force && this.cfg.publicIpPollSec <= 0) {
       return;
     }
@@ -1361,14 +1511,15 @@ class Monitor {
     } catch {
       return;
     }
+    if (!this.lifecycle.enabled) return;
     const prev = this.lastPublicIp;
-    if (!prev) {
+    if (!prev && !force) {
       this.lastPublicIp = found.ip;
       this.lastPublicIpAt = Date.now();
       return;
     }
-    if (found.ip !== prev) {
-      this.emit(`[${stamp()}] [PUBLIC IP] Network change detected: ${prev} -> ${found.ip} (via ${found.service}, direct, proxy bypassed). Marking RECONNECTING (not failed) and verifying.`);
+    if (force || found.ip !== prev) {
+      this.emit(`[${stamp()}] [PUBLIC IP] ${force ? 'Manual network verification' : 'Network change detected'}: ${prev ?? 'unknown'} -> ${found.ip} (via ${found.service}, direct, proxy bypassed). Marking RECONNECTING (not failed) and verifying.`);
       this.lastPublicIp = found.ip;
       this.lastPublicIpAt = Date.now();
       // Attributed change: RECONNECTING owns the outcome — never PROXY_FAILED
@@ -1421,6 +1572,10 @@ class Monitor {
    * non-proxy rules.
    */
   async manualSgRepair(): Promise<void> {
+    await this.lifecycle.run(() => this.manualSgRepairInner());
+  }
+
+  private async manualSgRepairInner(): Promise<void> {
     const gid = this.cfg.securityGroupId.trim();
     if (!this.cfg.enableAwsRepair || gid.length === 0) {
       void vscode.window.showWarningMessage('SG repair needs opencodeProxyHealth.securityGroupId set (and enableAwsRepair on).');
@@ -1461,7 +1616,7 @@ class Monitor {
         p.report({ message: `:22 blocked — re-authorizing ${ip}/32…` });
         this.emit(`[${stamp()}] Manual SG repair: :22 unreachable — running describe/revoke/authorize/describe for ${ip}/32 (never 0.0.0.0/0).`);
         try {
-          const r = await ensureSshAccess(defaultExecAsync, this.recoveryMachineConfig(), ip);
+          const r = await ensureSshAccess(this.proxyExec, this.recoveryMachineConfig(), ip);
           this.emit(`[${stamp()}] Manual SG repair: ${r.detail}`);
           if (r.ok && r.authorizedCurrent) {
             void vscode.window.showInformationMessage(`SG repaired for ${ip}/32. Run "Recover Proxy" if the tunnel is still down.`);
@@ -1547,6 +1702,10 @@ class Monitor {
 
   /** Manual, user-invoked recovery of one task and its port. */
   async restartTask(taskName: string): Promise<void> {
+    await this.lifecycle.run(() => this.restartTaskInner(taskName));
+  }
+
+  private async restartTaskInner(taskName: string): Promise<void> {
     if (this.cfg.supervisorMode === 'direct') {
       const msg = `supervisor=direct owns ssh.exe/hpts itself — scheduled task "${taskName}" is disabled by design. Use "Recover Proxy (direct supervisor)" instead.`;
       this.emit(`[${stamp()}] [WARN] ${msg}`);
@@ -1616,6 +1775,10 @@ class Monitor {
    * mutates machine-wide environment variables.
    */
   async recoverChain(): Promise<void> {
+    await this.lifecycle.run(() => this.recoverChainInner());
+  }
+
+  private async recoverChainInner(): Promise<void> {
     if (this.cfg.supervisorMode === 'direct') {
       const msg = 'supervisor=direct owns ssh.exe/hpts itself — the Task Scheduler runbook is disabled by design. Running direct state-machine recovery instead.';
       this.emit(`[${stamp()}] [WARN] ${msg}`);
@@ -1706,7 +1869,7 @@ class Monitor {
         );
         return reading.ip;
       },
-      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      sleep: (ms) => this.lifecycle.sleep(ms),
       now: () => Date.now(),
       onStep: (s) => {
         const label = `${s.n}. ${s.title}`;
@@ -1725,12 +1888,13 @@ class Monitor {
    * extension host, VS Code, and your existing terminals are left untouched.
    */
   private async maybeLaunchOpencode(env: Record<string, string>): Promise<void> {
+    if (!this.lifecycle.enabled) return;
     if (!this.cfg.runbookLaunchOpencode) {
-      const pick = await vscode.window.showInformationMessage(
+      const pick = await this.lifecycle.waitWhileEnabled(vscode.window.showInformationMessage(
         `Proxy chain is healthy. Start opencode now with the proxy env applied?`,
         'Start opencode',
         'No thanks',
-      );
+      ));
       if (pick !== 'Start opencode') {
         this.emit(
           `[${stamp()}] opencode not launched. To get the proxy env, start it yourself in a terminal after running:`,
@@ -1741,10 +1905,12 @@ class Monitor {
         return;
       }
     }
+    if (!this.lifecycle.enabled) return;
     const term = vscode.window.createTerminal({
       name: 'opencode (proxied)',
       env: { ...process.env, ...env } as Record<string, string | null>,
     });
+    this.proxiedTerminals.add(term);
     term.show();
     term.sendText(this.cfg.opencodeCommand);
     this.emit(
@@ -1759,6 +1925,7 @@ class Monitor {
    * below the 10s poll interval, overlapping 15s-style pile-ups are impossible.
    */
   private async check(manual: boolean): Promise<void> {
+    if (!this.lifecycle.enabled) return;
     if (!this.probeGate.tryEnter()) {
       if (manual) {
         if (this.currentCheck) {
@@ -1804,6 +1971,7 @@ class Monitor {
     // Echo services and Zen NEVER run here: one failed probe is one sample.
     const { result, timedOut } = await runHealthCheckGuarded(cfg);
     await this.readRequests();
+    if (!this.lifecycle.enabled) return;
 
     const leg: HealthState = timedOut ? 'UNKNOWN' : deriveState(result);
     if (timedOut) {
@@ -1871,6 +2039,7 @@ class Monitor {
       }
     }
 
+    if (!this.lifecycle.enabled) return;
     const slow =
       infraOk && cfg.slowThresholdMs > 0 && result.elapsedMs > cfg.slowThresholdMs;
     // While the direct state machine is actively driving the UI (SOCKS_STARTING,
@@ -1956,7 +2125,7 @@ class Monitor {
       }
       for (const ev of folded.events) {
         if (ev === 'notify-proxy-down') {
-          this.notifyFail('OpenCode proxy connection lost. Recovering...');
+          this.notifyFail(this.cfg.autoRecover ? 'OpenCode proxy connection lost. Recovering...' : 'OpenCode proxy connection lost. Use Recover Proxy from the dashboard.');
         }
       }
       // Self-healing runs only on confirmation (PROXY_DOWN) inside
@@ -2012,6 +2181,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(monitor);
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('opencode-proxy-health.turnOff', () => monitor.turnOff()),
+    vscode.commands.registerCommand('opencode-proxy-health.turnOn', () => monitor.turnOn()),
     vscode.commands.registerCommand('opencode-proxy-health.refresh', () => monitor.refresh(true)),
     vscode.commands.registerCommand('opencode-proxy-health.showDiagnostics', () => monitor.showDashboard()),
     vscode.commands.registerCommand('opencode-proxy-health.showOutput', () => monitor.showOutput()),

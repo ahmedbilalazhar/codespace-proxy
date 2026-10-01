@@ -145,7 +145,7 @@ describe('recovery — dead tunnel vs dead echo (step D classification)', () => 
 });
 
 describe('probeSocksTunnel classification (error-shape based)', () => {
-  it('timeout after CONNECT counts as connected (tunnel forwards, echo is bad)', async () => {
+  it('timeout BEFORE the SOCKS handshake completes never counts as connected', async () => {
     // A sink server: accepts the SOCKS greeting, never replies.
     const sink = net.createServer((s) => {
       s.once('data', () => {
@@ -163,7 +163,7 @@ describe('probeSocksTunnel classification (error-shape based)', () => {
           });
         },
       });
-      assert.equal(r.connected, true, r.detail);
+      assert.equal(r.connected, false, r.detail);
     } finally {
       await new Promise<void>((r) => sink.close(() => r()));
     }

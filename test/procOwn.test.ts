@@ -133,7 +133,7 @@ describe('spawnSsh / spawnHpts (mocked spawn)', () => {
     const r = spawnSsh(DEFAULT_PROC_CONFIG, () => ({ pid: 1234 }));
     assert.equal(r.ok, true);
     assert.ok(!r.detail.includes('.pem'));
-    const h = spawnHpts(DEFAULT_PROC_CONFIG, () => ({ pid: 5678 }));
+    const h = spawnHpts({ ...DEFAULT_PROC_CONFIG, hptsCmd: 'C:\\tools\\hpts.cmd' }, () => ({ pid: 5678 }));
     assert.equal(h.ok, true);
   });
   it('no pid -> failure', () => {
