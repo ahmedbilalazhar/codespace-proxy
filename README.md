@@ -104,7 +104,7 @@ popups every few seconds while OpenCode coded through the proxy uninterrupted,
 followed by a false `recovered — down for 24s`.
 
 Root cause: every poll ran 8s+ IP-echo (ipify) and full Zen model-list fetches
-*through the proxy* and treated any one failure as proxy death, notifying on
+_through the proxy_ and treated any one failure as proxy death, notifying on
 every transition.
 
 New layered model (`src/health.ts` + `src/healthPolicy.ts`, pure + tested):
@@ -120,7 +120,7 @@ New layered model (`src/health.ts` + `src/healthPolicy.ts`, pure + tested):
   `ZEN_UNREACHABLE`). Never triggers SSH/SOCKS/hpts recovery.
 - Confirmation: strikes 1–2 → `DEGRADED` (status bar only, no notify, no
   recovery); strike 3 (`failureThreshold`) → `PROXY_DOWN` (one `OpenCode proxy
-  connection lost. Recovering...` notification, recovery allowed). Success
+connection lost. Recovering...` notification, recovery allowed). Success
   resets. Recent tracked OpenCode success vetoes transport-only strikes (K).
 - Single-flight: explicit `ProbeGate` + `running`/`currentCheck`; 8s overall
   guard below the 10s interval — overlapping probes impossible.
@@ -158,15 +158,15 @@ New default (`supervisorMode: "direct"`): the extension is the SOLE owner.
 
 - Exactly ONE `ssh.exe` + ONE `hpts`, matched by exact command line
   (`-D 127.0.0.1:1080 -N ubuntu@16.192.228.28`, `hpts -p 8080 -s
-  127.0.0.1:1080`). Random `ssh.exe` (git, other tunnels) is never assumed
+127.0.0.1:1080`). Random `ssh.exe` (git, other tunnels) is never assumed
   ours and never killed. Stale/redundant OWNED processes are deduped; a
   foreign listener on `:1080`/`:8080` is reported, not killed.
 - Layered state machine `src/recoveryMachine.ts` (A-H, bounded retries +
   exponential backoff, single-flight/idempotent, no busy-loop, no OpenCode
   needed):
   `SSH_PROCESS_DOWN -> AWS_SSH_UNREACHABLE -> SG_REPAIRING -> SOCKS_DOWN ->
-  SOCKS_STARTING -> SOCKS_UP -> HTTP_PROXY_DOWN -> HTTP_PROXY_STARTING ->
-  HTTP_PROXY_UP -> READY`, else `RECOVERY_FAILED`.
+SOCKS_STARTING -> SOCKS_UP -> HTTP_PROXY_DOWN -> HTTP_PROXY_STARTING ->
+HTTP_PROXY_UP -> READY`, else `RECOVERY_FAILED`.
   A: TCP 127.0.0.1:1080. B: TCP 16.192.228.28:22 (direct). C: kill stale owned
   ssh, spawn exactly ONE ssh, wait+verify 1080 (never assume process=healthy).
   D: SOCKS5 CONNECT through 1080, egress must equal 16.192.228.28. E: only
@@ -185,11 +185,11 @@ New default (`supervisorMode: "direct"`): the extension is the SOLE owner.
   recover. Handles Wi-Fi change, wake-from-sleep, DNS/AWS blips, timeouts,
   crashes, transient port absence.
 - Logs: `[PROXY CHECK] [AWS SSH CHECK] [PUBLIC IP] [SECURITY GROUP UPDATE]
-  [SSH START] [SSH STOP] [SOCKS CHECK] [SOCKS END-TO-END CHECK]
-  [HTTP BRIDGE START] [HTTP PROXY CHECK] [RECOVERY SUCCESS/FAILURE]` with
+[SSH START] [SSH STOP] [SOCKS CHECK] [SOCKS END-TO-END CHECK]
+[HTTP BRIDGE START] [HTTP PROXY CHECK] [RECOVERY SUCCESS/FAILURE]` with
   timestamps; key paths/credentials never logged.
 - Status: `SSH DOWN` (process missing) vs `AWS SSH UNREACHABLE` vs `FIXING
-  SG...` vs `SOCKS STARTING...` vs `HTTP STARTING...` vs `Proxy ready` vs
+SG...` vs `SOCKS STARTING...` vs `HTTP STARTING...` vs `Proxy ready` vs
   `RECOVERY FAILED`. No false "ssh.exe running therefore healthy".
 
 ### Disable Task Scheduler to avoid two supervisors fighting
@@ -210,7 +210,15 @@ schtasks-only path (`autoRecover` + one-click runbook, `src/recover.ts`).
 Attach to the CLI identity (no keys in the extension):
 
 ```json
-{ "Effect": "Allow", "Action": ["ec2:DescribeSecurityGroups", "ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress"], "Resource": "*" }
+{
+  "Effect": "Allow",
+  "Action": [
+    "ec2:DescribeSecurityGroups",
+    "ec2:AuthorizeSecurityGroupIngress",
+    "ec2:RevokeSecurityGroupIngress"
+  ],
+  "Resource": "*"
+}
 ```
 
 Scope `Resource` to the proxy SG when possible. Configure once via
@@ -229,11 +237,11 @@ telling you the direct IP).
    `READY`. Run twice → still ONE process (idempotent).
 3. SSH unreachable (roam): change network / revoke your `/32` manually →
    `AWS SSH UNREACHABLE` → direct public IP logged (proxy bypassed) → `SG
-   REPAIRING` → stale `/32` revoked + current `/32` added + verified →
+REPAIRING` → stale `/32` revoked + current `/32` added + verified →
    `:22` reachable → tunnel rebuilt → `READY`. Confirm in AWS console: no
    duplicates, no `0.0.0.0/0`.
 4. `hpts` crash: `taskkill /F /IM node.exe` (bridge only) → `HTTP BRIDGE
-   DOWN` → exactly ONE `hpts` respawned after SOCKS verified → `READY`.
+DOWN` → exactly ONE `hpts` respawned after SOCKS verified → `READY`.
 5. Startup: reload VS Code while tunnel down → bootstrap recovery runs once
    before any OpenCode use.
 6. Network switch: university → hotspot → `[PUBLIC IP] x → y` in Output +
@@ -251,15 +259,15 @@ egress, launch opencode — is now one command. **OpenCode Proxy: One-Click
 Recovery**, or the `🚀 One-click recovery` row at the top of the dashboard
 (hover it for a button). It runs:
 
-| # | Step | What it actually does |
-|---|------|----------------------|
-| 1 | START SSH TUNNEL | `schtasks /run "OpenCode SSH SOCKS5"` — **only** if `:1080` is closed |
-| 2 | CHECK SSH PORT | waits for TCP `127.0.0.1:1080` |
-| 3 | START HTTP PROXY BRIDGE | `schtasks /run "OpenCode HTTP Proxy Bridge"` — **only** if `:8080` is closed |
-| 4 | CHECK HTTP BRIDGE PORT | waits for TCP `127.0.0.1:8080` |
-| 5 | SET PROXY | builds the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` map for step 7 |
-| 6 | TEST PROXY | egress IP through the proxy must equal `expectedExternalIp` |
-| 7 | START OPENCODE | asks first, then opens a new terminal carrying the env |
+| #   | Step                    | What it actually does                                                        |
+| --- | ----------------------- | ---------------------------------------------------------------------------- |
+| 1   | START SSH TUNNEL        | `schtasks /run "OpenCode SSH SOCKS5"` — **only** if `:1080` is closed        |
+| 2   | CHECK SSH PORT          | waits for TCP `127.0.0.1:1080`                                               |
+| 3   | START HTTP PROXY BRIDGE | `schtasks /run "OpenCode HTTP Proxy Bridge"` — **only** if `:8080` is closed |
+| 4   | CHECK HTTP BRIDGE PORT  | waits for TCP `127.0.0.1:8080`                                               |
+| 5   | SET PROXY               | builds the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` map for step 7              |
+| 6   | TEST PROXY              | egress IP through the proxy must equal `expectedExternalIp`                  |
+| 7   | START OPENCODE          | asks first, then opens a new terminal carrying the env                       |
 
 Two properties worth knowing:
 
@@ -302,7 +310,7 @@ v0.8.0 fixes it:
 - `runScheduledTask` now detects the discarded request and returns
   `ok: false, outcome: 'ignored-running'`. A no-op can no longer be counted as
   a success, so budgets mean something.
-- New `planStuckTask` decides between *start* and *stop-then-start*. The one
+- New `planStuckTask` decides between _start_ and _stop-then-start_. The one
   rule that matters: **a port that answers always wins.** If the port is up the
   task is healthy, whatever Scheduler's state says, and it is never stopped.
 - After a start, the extension now **waits for the port** rather than assuming
@@ -401,8 +409,8 @@ work this does not need).
 - **What it will NOT do**: synthesise ssh/node command lines (no keys
   involved), touch config/auth, or act on remote failures (`PROXY_FAILED`,
   `ZEN_UNREACHABLE`, `MODEL_UNAVAILABLE`). A live port is left alone.
-- **Manual commands** (work even with auto-recovery off): *Restart SSH Tunnel
-  Task*, *Restart HTTP Bridge Task*. They leave an answering port alone and
+- **Manual commands** (work even with auto-recovery off): _Restart SSH Tunnel
+  Task_, _Restart HTTP Bridge Task_. They leave an answering port alone and
   verify that a recovered port opens.
 - Dashboard + tooltip show the auto-recovery state; recovery messages note
   how many attempts were made.
@@ -435,7 +443,7 @@ work this does not need).
   Settings / Clear-failure actions) instead of just dumping the output channel.
 - **On-demand deep diagnosis** on failure: exact (redacted) `ssh.exe`/bridge
   command lines, scheduled-task states, port listeners.
-- **Stage timings + SLOW warning** — see *where* time goes (probes/traffic/zen)
+- **Stage timings + SLOW warning** — see _where_ time goes (probes/traffic/zen)
   so "waiting on network" is distinguishable from "dead".
 - **Persistent history**: 24 h uptime % + outage list (survives reloads) and an
   optional rolling log file for overnight post-mortems.
@@ -498,10 +506,10 @@ to 1 if opencode can't even start) and records `*.running.json` / `*.done.json`
 in `%TEMP%\opencode-proxy-health\requests\` (model name only — prompts never
 stored; `--model=<id>` form also recognised). The extension then shows:
 
-| Status bar | Display state | Meaning |
-|---|---|---|
-| play glyph `$(play)` | `REQUEST_RUNNING` | n wrapper-tracked requests in flight (first-hand evidence) |
-| cross glyph `$(error)` | `REQUEST_FAILED` | last tracked request failed (exit ≠ 0 or wrapper died); clears on next success or via *Clear Request Failure* |
+| Status bar             | Display state     | Meaning                                                                                                       |
+| ---------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| play glyph `$(play)`   | `REQUEST_RUNNING` | n wrapper-tracked requests in flight (first-hand evidence)                                                    |
+| cross glyph `$(error)` | `REQUEST_FAILED`  | last tracked request failed (exit ≠ 0 or wrapper died); clears on next success or via _Clear Request Failure_ |
 
 Without the wrapper the overlay is inert — you'll see `Ready`, never a
 fabricated `Running`. Chain failures always take precedence over request info.
@@ -510,20 +518,20 @@ residual (documented) edge — running files older than 6 h are flagged stale.
 
 ## All status states (bar shows the glyph; hover/click for the text)
 
-| Bar glyph | State | Meaning |
-|---|---|---|
-| `$(sync~spin)` spinning arrows | `STARTING` | first check not finished yet |
-| `$(check)` tick | `HEALTHY` | full chain verified end-to-end |
-| `$(watch)` clock | `HEALTHY`-slow | healthy but check > `slowThresholdMs` (default 6 s) — "waiting on network" signal, per-stage timings in tooltip |
-| `$(play)` triangle | `REQUEST_RUNNING` | n wrapper-tracked requests in flight (first-hand evidence) |
-| `$(error)` cross | `REQUEST_FAILED` | last tracked request failed; clears on next success or via *Clear Request Failure* |
-| `$(debug-disconnect)` pulled plug | `SSH_DOWN` | :1080 refused **and** no `ssh.exe` process |
-| `$(plug)` connector | `SOCKS_DOWN` | :1080 refused but `ssh.exe` still runs (re-establishing?) |
-| `$(arrow-swap)` swap | `HTTP_BRIDGE_DOWN` | :1080 OK, :8080 refused |
-| `$(cloud)` cloud | `PROXY_FAILED` | ports open but no traffic flows, or egress IP ≠ expected EC2 IP |
-| `$(globe)` globe | `ZEN_UNREACHABLE` | proxy works, Zen not reachable (or non-200; 4xx = path OK, refused) |
-| `$(error)` cross | `MODEL_UNAVAILABLE` | Zen OK but model id missing from model list |
-| `$(question)` question mark | `UNKNOWN` | guard trip / unexpected shape — shown instead of guessing |
+| Bar glyph                         | State               | Meaning                                                                                                         |
+| --------------------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `$(sync~spin)` spinning arrows    | `STARTING`          | first check not finished yet                                                                                    |
+| `$(check)` tick                   | `HEALTHY`           | full chain verified end-to-end                                                                                  |
+| `$(watch)` clock                  | `HEALTHY`-slow      | healthy but check > `slowThresholdMs` (default 6 s) — "waiting on network" signal, per-stage timings in tooltip |
+| `$(play)` triangle                | `REQUEST_RUNNING`   | n wrapper-tracked requests in flight (first-hand evidence)                                                      |
+| `$(error)` cross                  | `REQUEST_FAILED`    | last tracked request failed; clears on next success or via _Clear Request Failure_                              |
+| `$(debug-disconnect)` pulled plug | `SSH_DOWN`          | :1080 refused **and** no `ssh.exe` process                                                                      |
+| `$(plug)` connector               | `SOCKS_DOWN`        | :1080 refused but `ssh.exe` still runs (re-establishing?)                                                       |
+| `$(arrow-swap)` swap              | `HTTP_BRIDGE_DOWN`  | :1080 OK, :8080 refused                                                                                         |
+| `$(cloud)` cloud                  | `PROXY_FAILED`      | ports open but no traffic flows, or egress IP ≠ expected EC2 IP                                                 |
+| `$(globe)` globe                  | `ZEN_UNREACHABLE`   | proxy works, Zen not reachable (or non-200; 4xx = path OK, refused)                                             |
+| `$(error)` cross                  | `MODEL_UNAVAILABLE` | Zen OK but model id missing from model list                                                                     |
+| `$(question)` question mark       | `UNKNOWN`           | guard trip / unexpected shape — shown instead of guessing                                                       |
 
 Hover = tooltip with timings, request, 24 h uptime. Click = dashboard
 (status rows, latency trend, uptime, deep diagnosis — failing chain rows
@@ -590,8 +598,8 @@ values fall back with a logged warning; changes re-arm live.
   deep diagnosis in output; restart → spinner → tick glyph +
   `[OK] RECOVERED (down for …)`.
 - Live request: `Invoke-TrackedOpencode.ps1 --version` writes a success
-  record; use a failing command to see `Muse: ERROR`, then *Clear Request
-  Failure*.
+  record; use a failing command to see `Muse: ERROR`, then _Clear Request
+  Failure_.
 - Live slow: set `slowThresholdMs: 1` → next healthy tick shows SLOW.
 - Live self-healing: set `autoRecover: true`, then observe a local port failure
   for two checks → expect a logged task start/reset attempt, a verified port,
