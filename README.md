@@ -1,4 +1,46 @@
-# OpenCode Proxy Health (v0.11.0)
+# OpenCode Proxy Health (v0.11.1)
+
+## SSH reaches EC2 but the SOCKS port never opens
+
+v0.11.1 captures bounded SSH/bridge stderr and exit codes, redacts the configured
+private-key path, and stops waiting for a port as soon as its child exits.
+Diagnostics and recovery notifications show the startup error. Missing or
+unreadable key files fail before SSH is launched. SSH uses the configured
+identity with `IdentitiesOnly=yes`; host verification remains enabled.
+The startup log and diagnostic report show the installed extension version.
+
+If SSH reports **Host key verification failed**, first verify the instance's
+SSH host fingerprint in the AWS EC2 console: select the instance, then
+**Actions → Monitor and troubleshoot → Get system log**. Find the
+`BEGIN SSH HOST KEY FINGERPRINTS` section and compare the corresponding
+algorithm/fingerprint with the SSH prompt. This is the instance host key,
+not the key-pair fingerprint shown on the EC2 Key pairs page. See
+[AWS connection prerequisites](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connection-prereqs-general.html).
+
+After verifying the fingerprint, connect interactively once using your actual
+configured key, user, host and port. For the default configuration:
+
+```powershell
+$key = "$env:USERPROFILE\.ssh\opencode-proxy-key.pem"
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" -i $key -p 22 -o BatchMode=no -o StrictHostKeyChecking=ask -o IdentitiesOnly=yes ubuntu@16.192.228.28 exit
+```
+
+Accept the trust prompt only if the fingerprint matches the verified instance.
+Then run **OpenCode Proxy: Recover Proxy**. Background SSH uses `BatchMode=yes`,
+so it cannot ask you to accept a previously unknown host. If SSH reports a
+changed host key instead, investigate the change and verify the replacement
+before editing that host's known-hosts entry. Do not disable host verification
+or delete the whole known-hosts file.
+
+If port 22 is already reachable, adding a security-group ID will not resolve
+host trust or authentication errors. A passphrase-protected private key must
+be available through `ssh-agent` for background SSH to use it. A successful
+interactive login must be followed by recovery and an end-to-end proxy check;
+it does not prove SOCKS forwarding or the HTTP bridge is working yet.
+
+Pulling the repository does not update the installed VSIX. After updating,
+build/package/install as described below and reload VS Code. Confirm the
+startup log says `version 0.11.1`.
 
 ## Turn the proxy off and back on
 

@@ -27,6 +27,7 @@ const tasks = require('../src/recover');
 
 function createMonitor(saved = new Map<string, unknown>()) {
   const context = {
+    extension: { packageJSON: { version: '0.11.1' } },
     subscriptions: [], globalState: {
       get: (key: string, fallback: unknown) => saved.has(key) ? saved.get(key) : fallback,
       update: async (key: string, value: unknown) => { saved.set(key, value); },
@@ -46,6 +47,35 @@ function healthResult(ok: boolean) {
     zenMs: null, transportStatus: ok ? 204 : null,
   } };
 }
+
+it('diagnostics identify the installed version and expand actual task names and ports', () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.sshTaskName = 'Custom SSH';
+  monitor.cfg.bridgeTaskName = 'Custom Bridge';
+  monitor.cfg.socksPort = 11080;
+  monitor.cfg.httpPort = 18080;
+  try {
+    const report = monitor.buildFullReport();
+    assert.match(report, /Extension version\s+0\.11\.1/);
+    assert.match(report, /127\.0\.0\.1:11080/);
+    assert.match(report, /hpts -p 18080/);
+    assert.match(report, /"Custom SSH" \/ "Custom Bridge"/);
+    assert.ok(!report.includes('${cfg.'));
+  } finally { monitor.dispose(); }
+});
+
+it('manual recovery preserves the actual startup error in diagnostics and its notification', async () => {
+  const { monitor } = createMonitor();
+  const detail = 'SSH exited with code 255: Host key verification failed.';
+  let notification = '';
+  monitor.notifyFail = (message: string) => { notification = message; };
+  machine.recoverProxy = async () => ({ ...readyOutcome, ok: false, state: 'RECOVERY_FAILED', logs: [{ tag: 'RECOVERY FAILURE', message: detail, at: 'now' }] });
+  try {
+    await monitor.runDirectRecovery('manual-command');
+    assert.match(monitor.buildFullReport(), /Recovery failure\s+SSH exited with code 255: Host key verification failed/);
+    assert.ok(notification.includes(detail));
+  } finally { monitor.dispose(); }
+});
 
 it('successful auto-recovery completes its parent health check instead of awaiting itself', { timeout: 1500 }, async () => {
   const { monitor } = createMonitor();

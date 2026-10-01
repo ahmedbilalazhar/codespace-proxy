@@ -404,6 +404,11 @@ export class Monitor {
   private schedulerConflictWarned = false;
   private wakeHook: vscode.Disposable | null = null;
   private cfg: ExtConfig = readExtConfig().cfg;
+  private lastRecoveryFailure: string | null = null;
+
+  private get extensionVersion(): string {
+    return this.context.extension?.packageJSON?.version ?? 'unknown';
+  }
 
   constructor(
     private context: vscode.ExtensionContext,
@@ -441,7 +446,7 @@ export class Monitor {
       }
     }
     this.emit(
-      `[${stamp()}] Monitor started (interval ${cfg.intervalSec}s, supervisor=${cfg.supervisorMode}). Auto-recovery ${cfg.autoRecover ? (cfg.autoRecoverDryRun ? 'dry run' : 'enabled') : 'off'}. Direct bootstrap ${cfg.bootstrapRecoverOnStartup ? 'on' : 'off'}.`,
+      `[${stamp()}] Monitor started (version ${this.extensionVersion}, interval ${cfg.intervalSec}s, supervisor=${cfg.supervisorMode}). Auto-recovery ${cfg.autoRecover ? (cfg.autoRecoverDryRun ? 'dry run' : 'enabled') : 'off'}. Direct bootstrap ${cfg.bootstrapRecoverOnStartup ? 'on' : 'off'}.`,
     );
     if (cfg.supervisorMode === 'direct') {
       this.emit(
@@ -927,8 +932,10 @@ export class Monitor {
             downSince: this.downSince,
           })
         : 'OpenCode Proxy Health\n────────────────────────\n(no check has completed yet)',
-      `Supervisor           ${cfg.supervisorMode}${cfg.supervisorMode === 'direct' ? ' (SOLE owner: 1x ssh.exe -D 127.0.0.1:1080 + 1x hpts -p 8080; Task Scheduler tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}" must be DISABLED)' : ` (legacy tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}")`}`,
+      `Extension version    ${this.extensionVersion}`,
+      `Supervisor           ${cfg.supervisorMode}${cfg.supervisorMode === 'direct' ? ` (SOLE owner: 1x ssh.exe -D ${cfg.socksHost}:${cfg.socksPort} + 1x hpts -p ${cfg.httpPort}; Task Scheduler tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}" must be DISABLED)` : ` (legacy tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}")`}`,
       `Recovery state       ${this.recoveryState ?? '(none)'}${this.directRecoveryRunning ? ' (running)' : ''}`,
+      ...(this.lastRecoveryFailure ? [`Recovery failure     ${this.lastRecoveryFailure}`] : []),
       `AWS                  EC2 ${cfg.ec2Host}:${cfg.sshPort} · SG ${cfg.securityGroupId || '(not configured)'}${cfg.awsProfile ? ` · profile ${cfg.awsProfile}` : ''}${cfg.awsRegion ? ` · region ${cfg.awsRegion}` : ''}`,
       `Direct public IP     ${this.lastPublicIp ?? '(unknown — direct poll, proxy bypassed)'}${this.lastPublicIp ? ` (${Math.round((Date.now() - this.lastPublicIpAt) / 1000)}s ago)` : ''}`,
       `Requests             ${this.requestLine()} — ${this.requestDetail()}`,
@@ -1426,6 +1433,7 @@ export class Monitor {
       this.lastDirectRecoveryAt = Date.now();
       this.recoveryState = outcome.state;
       if (outcome.ok) {
+        this.lastRecoveryFailure = null;
         this.cadence = emptyRecoveryCadence();
         this.recoveryFailNotified = false;
         this.emit(`[${stamp()}] [RECOVERY SUCCESS] Direct recovery READY in ${outcome.elapsedMs}ms — SOCKS :${rcfg.socksPort} + HTTP :${rcfg.httpPort} verified end-to-end.`);
@@ -1441,6 +1449,7 @@ export class Monitor {
         }
         void this.checkSchedulerConflict();
       } else {
+        this.lastRecoveryFailure = [...outcome.logs].reverse().find((l) => l.tag === 'RECOVERY FAILURE')?.message ?? outcome.state;
         this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
         this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery FAILED (${outcome.state}): path ${outcome.path.join(' -> ')}.`);
         this.display = 'RECOVERY_FAILED';
@@ -1450,11 +1459,12 @@ export class Monitor {
         const manual = reason === 'manual-command' || reason === 'dashboard' || reason === 'manual-runbook-redirect';
         if (manual || !this.recoveryFailNotified) {
           this.recoveryFailNotified = true;
-          this.notifyFail(`Proxy recovery failed (${outcome.state}). Will keep retrying in the background — see output log.`);
+          this.notifyFail(`Proxy recovery failed: ${this.lastRecoveryFailure.slice(0, 350)} See output log for details.`);
         }
       }
     } catch (e) {
       if (!this.lifecycle.enabled) return;
+      this.lastRecoveryFailure = (e as Error).message;
       this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
       this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery threw: ${(e as Error).message}`);
       this.display = 'RECOVERY_FAILED';
