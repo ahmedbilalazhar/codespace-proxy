@@ -1,6 +1,49 @@
 # OpenCode Proxy Health (v0.11.1)
 
+## Automatic recovery after changing Wi-Fi
+
+In **Preferences: Open User Settings (JSON)**, merge these settings into your
+existing object. Replace the security-group placeholder with the group attached
+to your EC2 instance. Configure a valid AWS CLI profile on the same Windows
+machine; CloudShell's credentials do not configure the local extension.
+
+```json
+{
+  "opencodeProxyHealth.supervisorMode": "direct",
+  "opencodeProxyHealth.securityGroupId": "YOUR_ATTACHED_SECURITY_GROUP_ID",
+  "opencodeProxyHealth.awsRegion": "eu-north-1",
+  "opencodeProxyHealth.enableAwsRepair": true,
+  "opencodeProxyHealth.autoRecover": true,
+  "opencodeProxyHealth.autoRecoverDryRun": false,
+  "opencodeProxyHealth.bootstrapRecoverOnStartup": true,
+  "opencodeProxyHealth.publicIpPollSec": 30
+}
+```
+
+The extension checks the current IPv4 address directly, even while the proxy is
+down. On an IP change it verifies the chain, authorizes the new `/32` if AWS SSH
+is blocked, then recovers and verifies the proxy. New rules carry the
+`opencode-proxy` description so subsequent repairs can identify them. New
+access is verified before stale managed rules are removed. Unmarked manual
+rules and old tag-only rules are retained; identify them manually before any
+cleanup. Do not label another user's rule as managed by this proxy.
+
+Network checks run one at a time, respect `autoRecover: false`, and stop doing
+work when the proxy is turned off. Failed requests cannot release another
+request's proxy bypass. Default polling remains off until roaming is enabled.
+
+Automatic IP repair requires access to the AWS API and outbound SSH on the
+configured port. A captive portal must be completed first. A network that
+blocks SSH will still require an allowed transport; opening the EC2 firewall
+does not bypass that network's restrictions. Host trust and SSH authentication
+must also be established before background recovery can succeed.
+
 ## SSH reaches EC2 but the SOCKS port never opens
+
+Health probes also decode HTTP chunk framing before parsing IP echoes or model
+lists, preserve UTF-8 across network packet boundaries, and accept bodyless
+HEAD/204 responses. Malformed or truncated responses remain failures. A skipped
+or dry-run network recovery cannot leave the monitor stuck in RECONNECTING.
 
 v0.11.1 captures bounded SSH/bridge stderr and exit codes, redacts the configured
 private-key path, and stops waiting for a port as soon as its child exits.
@@ -278,14 +321,14 @@ HTTP_PROXY_UP -> READY`, else `RECOVERY_FAILED`.
 - Roaming-IP repair: when :22 is unreachable, the current public IP is
   discovered DIRECTLY (https://api.ipify.org → checkip.amazonaws.com →
   ifconfig.me/ip, proxy bypassed — never via :8080), the SG is described
-  first, stale proxy `/32`s revoked, current `/32` authorized, re-described
-  to verify, then :22 retried. Uses your existing AWS CLI profile
+  first, current `/32` authorized and re-described to verify, then stale
+  managed `/32`s removed and :22 retried. Uses your existing AWS CLI profile
   (`awsProfile`/`awsRegion`); no credentials in source/settings/logs. Never
   opens `0.0.0.0/0`, never touches foreign rules, never adds duplicates.
 - Startup: health-check first; if unhealthy and `bootstrapRecoverOnStartup`
   (default on), run the machine once — works before OpenCode is usable.
 - Network change: lightweight direct public-IP poll every `publicIpPollSec`
-  (default 120s, min 30s — never every few ms); on change, re-check and
+  (default off; when enabled, min 30s); on change, re-check and
   recover. Handles Wi-Fi change, wake-from-sleep, DNS/AWS blips, timeouts,
   crashes, transient port absence.
 - Logs: `[PROXY CHECK] [AWS SSH CHECK] [PUBLIC IP] [SECURITY GROUP UPDATE]

@@ -28,6 +28,8 @@ import * as tls from 'tls';
 import { execFile } from 'child_process';
 import type { DisplayState } from './status';
 import { EXPECTED_PROXY_EGRESS_IP } from './netModel';
+import { parseHttpResponse, type ParsedHttpResponse } from './httpResponse';
+export { parseHttpResponse } from './httpResponse';
 
 export interface HealthConfig {
   socksHost: string;
@@ -205,27 +207,7 @@ export function checkProcessRunning(imageName: string, execFn?: ExecFn): Promise
 // HTTP-via-proxy helpers (plain-Node, zero dependencies)
 // ---------------------------------------------------------------------------
 
-interface ParsedHttpResponse {
-  statusCode: number;
-  body: string;
-}
-
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
-
-export function parseHttpResponse(raw: string): ParsedHttpResponse {
-  const sep = raw.indexOf('\r\n\r\n');
-  if (sep === -1) {
-    throw new Error('incomplete HTTP response (no header terminator)');
-  }
-  const headerBlock = raw.slice(0, sep);
-  const body = raw.slice(sep + 4);
-  const statusLine = headerBlock.split('\r\n', 1)[0] ?? '';
-  const m = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
-  if (!m) {
-    throw new Error(`unparseable HTTP status line: ${statusLine.slice(0, 80)}`);
-  }
-  return { statusCode: parseInt(m[1], 10), body };
-}
 
 /**
  * GET an http:// URL through a plain HTTP proxy (absolute-URI request form,
@@ -252,7 +234,7 @@ export function fetchViaHttpProxy(
     }
     let settled = false;
     const socket = new net.Socket();
-    let raw = '';
+    let raw: Buffer = Buffer.alloc(0);
     const finish = (err: Error | null, body?: string) => {
       if (settled) {
         return;
@@ -278,11 +260,11 @@ export function fetchViaHttpProxy(
     socket.once('connect', () => {
       socket.write(
         `GET ${targetUrl} HTTP/1.1\r\nHost: ${u.host}\r\nConnection: close\r\n` +
-          `User-Agent: opencode-proxy-health\r\n\r\n`,
+          `User-Agent: opencode-proxy-health\r\nAccept-Encoding: identity\r\n\r\n`,
       );
     });
     socket.on('data', (chunk: Buffer) => {
-      raw += chunk.toString('utf8');
+      raw = Buffer.concat([raw, chunk]);
       if (raw.length > MAX_BODY_BYTES) {
         finish(new Error('proxy response exceeded size limit'));
       }
@@ -375,7 +357,7 @@ export function fetchHttpsViaProxy(
     let tlsSocket: tls.TLSSocket | null = null;
     const proxySocket = new net.Socket();
     let connectHead = '';
-    let tlsData = '';
+    let tlsData: Buffer = Buffer.alloc(0);
 
     const fail = (msg: string) => finish(new Error(msg));
 
@@ -400,7 +382,7 @@ export function fetchHttpsViaProxy(
       }
       let parsed: ParsedHttpResponse;
       try {
-        parsed = parseHttpResponse(connectHead);
+        parsed = parseHttpResponse(connectHead, { method: 'CONNECT' });
       } catch (e) {
         finish(e as Error);
         return;
@@ -416,7 +398,7 @@ export function fetchHttpsViaProxy(
           () => {
             tlsSocket?.write(
               `${method} ${path} HTTP/1.1\r\nHost: ${targetHost}\r\nConnection: close\r\n` +
-                `Accept: ${acceptHeader}\r\nUser-Agent: opencode-proxy-health\r\n\r\n`,
+                `Accept: ${acceptHeader}\r\nAccept-Encoding: identity\r\nUser-Agent: opencode-proxy-health\r\n\r\n`,
             );
           },
         );
@@ -426,7 +408,7 @@ export function fetchHttpsViaProxy(
       }
       tlsSocket.setTimeout(timeoutMs);
       tlsSocket.on('data', (d: Buffer) => {
-        tlsData += d.toString('utf8');
+        tlsData = Buffer.concat([tlsData, d]);
         if (tlsData.length > MAX_BODY_BYTES) {
           fail('Zen response exceeded size limit');
         }
@@ -439,7 +421,7 @@ export function fetchHttpsViaProxy(
           return;
         }
         try {
-          finish(null, parseHttpResponse(tlsData));
+          finish(null, parseHttpResponse(tlsData, { method }));
         } catch (e) {
           finish(e as Error);
         }

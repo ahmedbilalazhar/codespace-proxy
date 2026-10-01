@@ -346,7 +346,7 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "description": "Seconds between automatic direct public-IP polls (proxy bypassed). 0 (default) = MANUAL mode: polling is off, the proxy is never disturbed on a stable network; use 'Check Network / Repair SG Now' after a Wi-Fi change. Set >0 only if you roam constantly and want automatic detection."
+          "description": "Seconds between direct public-IP polls (proxy bypassed; minimum effective interval 30s). 0 disables polling. For automatic Wi-Fi recovery set 30, autoRecover=true, supervisorMode=direct, and configure securityGroupId + local AWS CLI access. Proxy Off pauses all checks and repair."
         },
         "opencodeProxyHealth.recoveryMaxAttempts": {
           "type": "number",

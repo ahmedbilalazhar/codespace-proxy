@@ -24,6 +24,7 @@ loader._load = originalLoad;
 const health = require('../src/health');
 const machine = require('../src/recoveryMachine');
 const tasks = require('../src/recover');
+const awsNet = require('../src/awsNet');
 
 function createMonitor(saved = new Map<string, unknown>()) {
   const context = {
@@ -74,6 +75,105 @@ it('manual recovery preserves the actual startup error in diagnostics and its no
     await monitor.runDirectRecovery('manual-command');
     assert.match(monitor.buildFullReport(), /Recovery failure\s+SSH exited with code 255: Host key verification failed/);
     assert.ok(notification.includes(detail));
+  } finally { monitor.dispose(); }
+});
+
+it('an automatic Wi-Fi IP change owns exactly one recovery despite a failed health check', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.lastPublicIp = '1.1.1.1';
+  monitor.baseState = 'SSH_DOWN';
+  let recoveries = 0;
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  monitor.runDirectRecovery = async (reason: string) => { assert.equal(reason, 'network-change'); recoveries++; };
+  monitor.check = async () => { monitor.display = 'PROXY_DOWN'; await monitor.maybeRecover(); };
+  try {
+    await monitor.pollPublicIpOnce();
+    assert.equal(recoveries, 1);
+    assert.equal(monitor.lastPublicIp, '9.9.9.9');
+    assert.equal(monitor.publicIpPollRunning, false);
+  } finally { monitor.dispose(); }
+});
+
+it('the first automatic IP discovery checks and repairs an unhealthy proxy', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let recoveries = 0;
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  monitor.check = async () => {};
+  monitor.runDirectRecovery = async () => { recoveries++; };
+  try { await monitor.pollPublicIpOnce(); assert.equal(recoveries, 1); }
+  finally { monitor.dispose(); }
+});
+
+it('overlapping network polls discover and repair only once', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let release!: () => void;
+  let fetched = 0;
+  let repaired = 0;
+  awsNet.fetchDirectPublicIp = () => { fetched++; return new Promise((r) => { release = () => r({ ip: '9.9.9.9', service: 'test' }); }); };
+  monitor.check = async () => {};
+  monitor.runDirectRecovery = async () => { repaired++; };
+  try {
+    const first = monitor.pollPublicIpOnce();
+    await new Promise((r) => setImmediate(r));
+    await monitor.pollPublicIpOnce();
+    release();
+    await first;
+    assert.equal(fetched, 1);
+    assert.equal(repaired, 1);
+  } finally { monitor.dispose(); }
+});
+
+it('automatic network polling respects autoRecover=false and off during discovery', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.cfg.autoRecover = false;
+  awsNet.fetchDirectPublicIp = async () => assert.fail('lookup despite opt-out');
+  monitor.runDirectRecovery = async () => assert.fail('repair despite opt-out');
+  try {
+    await monitor.pollPublicIpOnce();
+    monitor.cfg.autoRecover = true;
+    awsNet.fetchDirectPublicIp = async () => { monitor.lifecycle.enabled = false; return { ip: '9.9.9.9', service: 'test' }; };
+    await monitor.pollPublicIpOnce();
+    assert.equal(monitor.lastPublicIp, null);
+    assert.equal(monitor.publicIpPollRunning, false);
+  } finally { monitor.dispose(); }
+});
+
+it('a dry-run network recovery releases RECONNECTING without launching processes', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.cfg.autoRecoverDryRun = true;
+  monitor.baseState = 'SSH_DOWN';
+  monitor.check = async () => {};
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  machine.recoverProxy = async () => assert.fail('dry run launched recovery');
+  try {
+    await monitor.pollPublicIpOnce();
+    assert.equal(monitor.reconnecting, false);
+    assert.equal(monitor.publicIpPollRunning, false);
+    assert.equal(monitor.display, 'DEGRADED');
+  } finally { monitor.dispose(); }
+});
+
+it('a thrown network health check releases attribution and permits later polling', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let checks = 0;
+  monitor.check = async () => { checks++; throw new Error('probe failed'); };
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  try {
+    await monitor.pollPublicIpOnce(true);
+    assert.equal(monitor.reconnecting, false);
+    assert.equal(monitor.display, 'DEGRADED');
+    await monitor.pollPublicIpOnce(true);
+    assert.equal(checks, 2);
+    assert.equal(monitor.publicIpPollRunning, false);
   } finally { monitor.dispose(); }
 });
 

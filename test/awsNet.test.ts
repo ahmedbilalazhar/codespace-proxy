@@ -128,7 +128,7 @@ describe('ensureSshAccess', () => {
       calls.push([file, ...args]);
       if (args.includes('describe-security-groups')) {
         return authorized
-          ? JSON.stringify([{ IpProtocol: 'tcp', FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: '9.9.9.9/32', Description: 'opencode-proxy' }] }])
+          ? JSON.stringify([{ IpProtocol: 'tcp', FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: '9.9.9.9/32', Description: 'opencode-proxy' }, { CidrIp: '1.1.1.1/32', Description: 'opencode-proxy SSH' }] }])
           : JSON.stringify([{ IpProtocol: 'tcp', FromPort: 22, ToPort: 22, IpRanges: [{ CidrIp: '1.1.1.1/32', Description: 'opencode-proxy SSH' }] }]);
       }
       if (args.includes('revoke-security-group-ingress')) {
@@ -145,6 +145,7 @@ describe('ensureSshAccess', () => {
     assert.deepEqual(r.revoked, ['1.1.1.1/32']);
     assert.ok(calls.some((c) => c.includes('revoke-security-group-ingress')));
     assert.ok(calls.some((c) => c.includes('authorize-security-group-ingress')));
+    assert.ok(calls.findIndex((c) => c.includes('authorize-security-group-ingress')) < calls.findIndex((c) => c.includes('revoke-security-group-ingress')));
   });
   it('never authorizes 0.0.0.0/0 and refuses IPv6/non-IP', async () => {
     let called = false;

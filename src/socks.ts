@@ -21,6 +21,7 @@
 
 import * as net from 'net';
 import { isPlausibleIp } from './health';
+import { parseHttpResponse } from './httpResponse';
 
 export interface SocksE2EResult {
   /** Egress IP observed through the SOCKS tunnel. */
@@ -217,17 +218,17 @@ export async function fetchViaSocks5(
     // 3. Plain HTTP GET through the established tunnel.
     const req =
       `GET ${httpPath} HTTP/1.1\r\nHost: ${targetHost}\r\nConnection: close\r\n` +
-      `User-Agent: opencode-proxy-health\r\n\r\n`;
+      `User-Agent: opencode-proxy-health\r\nAccept-Encoding: identity\r\n\r\n`;
     await writeAll(socket, Buffer.from(req, 'utf8'));
 
     // 4. Read until close/timeout, then split headers/body.
-    const raw: string = await new Promise((resolve, reject) => {
-      let acc = '';
+    const raw: Buffer = await new Promise((resolve, reject) => {
+      let acc: Buffer = Buffer.alloc(0);
       const timer = setTimeout(() => {
         reject(new Error(`timed out after ${remaining()}ms waiting for HTTP response through SOCKS5`));
       }, remaining());
       socket.on('data', (c: Buffer) => {
-        acc += c.toString('utf8');
+        acc = Buffer.concat([acc, c]);
         if (acc.length > 4 * 1024 * 1024) {
           clearTimeout(timer);
           reject(new Error('response through SOCKS5 exceeded size limit'));
@@ -239,7 +240,7 @@ export async function fetchViaSocks5(
       });
       socket.once('close', () => {
         clearTimeout(timer);
-        if (!acc) {
+        if (acc.length === 0) {
           reject(new Error('empty response through SOCKS5 tunnel'));
         } else {
           resolve(acc);
@@ -250,47 +251,16 @@ export async function fetchViaSocks5(
       socket.once('end', () => {
         // Give 'close' a tick to fire; if data already complete, resolve now.
         setTimeout(() => {
-          if (acc) {
+          if (acc.length > 0) {
             clearTimeout(timer);
             resolve(acc);
           }
         }, 50);
       });
     });
-    const sep = raw.indexOf('\r\n\r\n');
-    if (sep === -1) {
-      throw new Error('incomplete HTTP response through SOCKS5 (no header terminator)');
-    }
-    const statusLine = raw.slice(0, raw.indexOf('\r\n'));
-    const m = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
-    if (!m) {
-      throw new Error(`unparseable HTTP status through SOCKS5: ${statusLine.slice(0, 80)}`);
-    }
-    if (parseInt(m[1], 10) !== 200) {
-      throw new Error(`echo service answered HTTP ${m[1]} through SOCKS5`);
-    }
-    const headers = raw.slice(0, sep);
-    const body = Buffer.from(raw.slice(sep + 4), 'utf8');
-    if (/^transfer-encoding:\s*chunked\s*$/im.test(headers)) {
-      const chunks: Buffer[] = [];
-      let offset = 0;
-      for (;;) {
-        const lineEnd = body.indexOf('\r\n', offset);
-        if (lineEnd < 0) throw new Error('incomplete chunked response through SOCKS5');
-        const sizeText = body.subarray(offset, lineEnd).toString('ascii').split(';')[0];
-        if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error('invalid chunk size through SOCKS5');
-        const size = parseInt(sizeText, 16);
-        offset = lineEnd + 2;
-        if (size === 0) break;
-        if (offset + size + 2 > body.length || body.subarray(offset + size, offset + size + 2).toString() !== '\r\n') {
-          throw new Error('incomplete chunked response through SOCKS5');
-        }
-        chunks.push(body.subarray(offset, offset + size));
-        offset += size + 2;
-      }
-      return Buffer.concat(chunks).toString('utf8').trim();
-    }
-    return body.toString('utf8').trim();
+    const parsed = parseHttpResponse(raw);
+    if (parsed.statusCode !== 200) throw new Error(`echo service answered HTTP ${parsed.statusCode} through SOCKS5`);
+    return parsed.body.trim();
   } catch (e) {
     throw new SocksExchangeError((e as Error).message, connected);
   } finally {

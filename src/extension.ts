@@ -399,6 +399,7 @@ export class Monitor {
   private recoveryFailNotified = false;
   private bootstrapDone = false;
   private publicIpTimer: NodeJS.Timeout | null = null;
+  private publicIpPollRunning = false;
   private lastPublicIp: string | null = null;
   private lastPublicIpAt = 0;
   private schedulerConflictWarned = false;
@@ -1235,7 +1236,7 @@ export class Monitor {
    */
   private async maybeRecover(): Promise<void> {
     if (!this.lifecycle.enabled || !this.cfg.autoRecover) return;
-    if (this.runbookRunning || this.autoRecoveryRunning || this.manualRecoveryRunning || this.directRecoveryRunning) {
+    if (this.runbookRunning || this.autoRecoveryRunning || this.manualRecoveryRunning || this.directRecoveryRunning || this.publicIpPollRunning) {
       return;
     }
     // Direct supervisor owns recovery via the verified state machine; the
@@ -1505,7 +1506,14 @@ export class Monitor {
    * On a detected change: mark RECONNECTING (not failed), verify, recover.
    */
   private async pollPublicIpOnce(force = false): Promise<void> {
-    await this.lifecycle.run(() => this.pollPublicIpOnceInner(force));
+    if (this.publicIpPollRunning || !this.lifecycle.enabled) return;
+    if (!force && (!this.cfg.autoRecover || this.cfg.supervisorMode !== 'direct' || this.cfg.publicIpPollSec <= 0)) return;
+    this.publicIpPollRunning = true;
+    try { await this.lifecycle.run(() => this.pollPublicIpOnceInner(force)); }
+    catch (e) {
+      if (this.lifecycle.enabled) this.emit(`[${stamp()}] [NETWORK CHECK] Verification failed: ${(e as Error).message}`);
+    }
+    finally { this.publicIpPollRunning = false; }
   }
 
   private async pollPublicIpOnceInner(force = false): Promise<void> {
@@ -1521,27 +1529,33 @@ export class Monitor {
     } catch {
       return;
     }
-    if (!this.lifecycle.enabled) return;
+    if (!this.lifecycle.enabled || (!force && !this.cfg.autoRecover)) return;
+    if (this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) return;
     const prev = this.lastPublicIp;
-    if (!prev && !force) {
-      this.lastPublicIp = found.ip;
-      this.lastPublicIpAt = Date.now();
-      return;
-    }
-    if (force || found.ip !== prev) {
+    this.lastPublicIp = found.ip;
+    this.lastPublicIpAt = Date.now();
+    if (force || (prev !== null && found.ip !== prev) || (!prev && this.baseState !== 'HEALTHY')) {
       this.emit(`[${stamp()}] [PUBLIC IP] ${force ? 'Manual network verification' : 'Network change detected'}: ${prev ?? 'unknown'} -> ${found.ip} (via ${found.service}, direct, proxy bypassed). Marking RECONNECTING (not failed) and verifying.`);
-      this.lastPublicIp = found.ip;
-      this.lastPublicIpAt = Date.now();
       // Attributed change: RECONNECTING owns the outcome — never PROXY_FAILED
       // before the G-sequence (check :22, SG repair, rebuild, verify) settles.
       this.reconnecting = true;
       this.display = 'RECONNECTING';
       this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
-      await this.check(false);
-      if (this.baseState !== 'HEALTHY' && this.cfg.supervisorMode === 'direct') {
-        await this.runDirectRecovery('network-change');
-      } else {
-        this.reconnecting = false;
+      try {
+        await this.check(false);
+        if (this.lifecycle.enabled && (force || this.cfg.autoRecover) && this.baseState !== 'HEALTHY' && this.cfg.supervisorMode === 'direct') {
+          await this.runDirectRecovery('network-change');
+        }
+      } finally {
+        // A dry run, skipped recovery, or thrown check must release the
+        // attribution flag or future failures remain RECONNECTING forever.
+        if (!this.directRecoveryRunning) {
+          this.reconnecting = false;
+          if (this.lifecycle.enabled && this.display === 'RECONNECTING') {
+            this.display = this.policy.verdict === 'PROXY_DOWN' ? 'PROXY_DOWN' : 'DEGRADED';
+            this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
+          }
+        }
       }
     }
   }
@@ -1557,7 +1571,7 @@ export class Monitor {
       void vscode.window.showWarningMessage('Manual network check applies to supervisor=direct only.');
       return;
     }
-    if (this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) {
+    if (this.publicIpPollRunning || this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) {
       void vscode.window.showInformationMessage('A recovery is already running — let it finish first.');
       return;
     }
