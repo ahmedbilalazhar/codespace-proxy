@@ -85,6 +85,23 @@ Pulling the repository does not update the installed VSIX. After updating,
 build/package/install as described below and reload VS Code. Confirm the
 startup log says `version 0.11.1`.
 
+## VS Code shows "Error acquiring .NET" / WebRequestError
+
+This extension has no .NET runtime dependency. That message comes from the
+.NET Install Tool used by another extension. Open **View → Output**, select
+the .NET installation/runtime channel, and copy the full failure including
+the download URL and underlying error. `WebRequestError` alone does not
+identify a firewall, proxy, TLS, or download failure.
+
+Verify the proxy is READY before configuring .NET to use it. When the local
+HTTP bridge is healthy and you want .NET downloads through it, the supported
+setting is `"dotnetAcquisitionExtension.proxyUrl": "http://127.0.0.1:8080"`
+(use your configured HTTP port). Remove that explicit setting when downloading
+directly with the proxy off. Proxy shutdown does not rewrite other extensions'
+settings or your existing terminal environment. Microsoft also documents using
+an existing compatible .NET installation through `existingDotnetPath` in its
+[C# Dev Kit troubleshooting guide](https://code.visualstudio.com/docs/csharp/cs-dev-kit-faq#_net-sdk).
+
 ## Turn the proxy off and back on
 
 Open the VS Code Command Palette (`Ctrl+Shift+P`) and run

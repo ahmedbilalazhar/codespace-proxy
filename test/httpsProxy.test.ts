@@ -6,14 +6,16 @@ import { fetchHttpsViaProxy } from '../src/health';
 
 // Use a real CONNECT bridge and an injected TLS stream to test HTTP framing
 // without adding a certificate library or changing production TLS verification.
-async function throughBridge(method: string, reply: Buffer, failTls = false) {
+async function throughBridge(method: string, reply: Buffer, failTls = false,
+  connectReply: string[] = ['HTTP/1.1 200 Connection established\r\nContent-Length: 0\r\n\r\n']) {
   const sockets = new Set<net.Socket>();
   const server = net.createServer((socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
     socket.once('data', (bytes) => {
       assert.match(bytes.toString(), /^CONNECT example\.test:443 HTTP\/1\.1/);
-      socket.write('HTTP/1.1 200 Connection established\r\nContent-Length: 0\r\n\r\n');
+      socket.write(connectReply[0]);
+      for (const part of connectReply.slice(1)) setImmediate(() => { if (!socket.destroyed) socket.write(part); });
     });
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -66,4 +68,15 @@ it('HTTPS HEAD probes succeed without the advertised GET body', async () => {
 
 it('TLS errors remain failures rather than bypassing certificate checks', async () => {
   await assert.rejects(() => throughBridge('GET', Buffer.alloc(0), true), /certificate verification failed/);
+});
+
+it('CONNECT rejection preserves its HTTP status before the error body arrives', async () => {
+  await assert.rejects(() => throughBridge('GET', Buffer.alloc(0), false,
+    ['HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 500\r\n\r\n']), /CONNECT refused with HTTP 407/);
+});
+
+it('CONNECT accepts successful 2xx statuses after a separate informational head', async () => {
+  const response = await throughBridge('HEAD', Buffer.from('HTTP/1.1 204 No Content\r\n\r\n'), false,
+    ['HTTP/1.1 103 Early Hints\r\n\r\n', 'HTTP/1.1 201 Tunnel established\r\n\r\n']);
+  assert.deepEqual(response, { statusCode: 204, body: '' });
 });

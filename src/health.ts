@@ -373,21 +373,25 @@ export function fetchHttpsViaProxy(
         return; // handed off to TLS; should not happen, but stay safe
       }
       connectHead += chunk.toString('utf8');
+      if (connectHead.length > 8192) {
+        fail('proxy CONNECT response headers too large');
+        return;
+      }
       const sep = connectHead.indexOf('\r\n\r\n');
       if (sep === -1) {
-        if (connectHead.length > 8192) {
-          fail('proxy CONNECT response headers too large');
-        }
         return;
       }
       let parsed: ParsedHttpResponse;
       try {
-        parsed = parseHttpResponse(connectHead, { method: 'CONNECT' });
+        parsed = parseHttpResponse(connectHead, { method: 'CONNECT', headersOnly: true });
       } catch (e) {
+        // An informational response may precede a final response in another
+        // packet. Keep its bounded header buffer until the final head arrives.
+        if ((e as Error).message === 'incomplete HTTP response (no header terminator)') return;
         finish(e as Error);
         return;
       }
-      if (parsed.statusCode !== 200) {
+      if (parsed.statusCode < 200 || parsed.statusCode >= 300) {
         fail(`proxy CONNECT refused with HTTP ${parsed.statusCode}`);
         return;
       }

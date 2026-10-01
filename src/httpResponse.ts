@@ -33,7 +33,7 @@ function decodeChunked(body: Buffer): Buffer {
 }
 
 /** Decode framing before UTF-8 so TCP splits cannot corrupt text/chunk sizes. */
-export function parseHttpResponse(raw: string | Buffer, options: { method?: string } = {}): ParsedHttpResponse {
+export function parseHttpResponse(raw: string | Buffer, options: { method?: string; headersOnly?: boolean } = {}): ParsedHttpResponse {
   const bytes = typeof raw === 'string' ? Buffer.from(raw, 'utf8') : raw;
   let offset = 0;
   for (;;) {
@@ -56,7 +56,8 @@ export function parseHttpResponse(raw: string | Buffer, options: { method?: stri
       headers.set(name, [...(headers.get(name) ?? []), line.slice(colon + 1).trim()]);
     }
     const method = options.method?.toUpperCase();
-    if (method === 'HEAD' || statusCode === 204 || statusCode === 304 || (method === 'CONNECT' && statusCode >= 200 && statusCode < 300)) {
+    // CONNECT negotiation inspects status before the error body arrives.
+    if (options.headersOnly || method === 'HEAD' || statusCode === 204 || statusCode === 304 || (method === 'CONNECT' && statusCode >= 200 && statusCode < 300)) {
       return { statusCode, body: '' };
     }
     let body = bytes.subarray(sep + 4);
