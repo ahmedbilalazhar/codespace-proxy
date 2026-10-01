@@ -28,7 +28,7 @@ goto wait
 
 :ready
 echo [%DATE% %TIME%] SOCKS5 %SOCKS% ready - starting hpts on :%PORT% >> "%LOG%"
-"%HPT%" -p %PORT% -s %SOCKS% >> "%LOG%" 2>&1
+call "%HPT%" -p %PORT% -s %SOCKS% >> "%LOG%" 2>&1
 set "rc=%errorlevel%"
 echo [%DATE% %TIME%] hpts exited with code %rc%; retrying in 15s >> "%LOG%"
 timeout /t 15 /nobreak >nul

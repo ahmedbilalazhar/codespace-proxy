@@ -94,6 +94,7 @@ describe('presentDisplay', () => {
 
   it('icon variants map to the shape-first set', () => {
     const expected: Record<DisplayState, string> = {
+      OFF: '$(debug-stop)',
       STARTING: '$(sync~spin)',
       HEALTHY: '$(check)',
       REQUEST_RUNNING: '$(play)',

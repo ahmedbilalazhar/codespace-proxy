@@ -68,6 +68,7 @@ export type ConfirmedDisplayState =
 
 /** Display states: chain + recovery + confirmed-health states + request overlays. */
 export type DisplayState =
+  | 'OFF'
   | HealthState
   | RecoveryDisplayState
   | ConfirmedDisplayState
@@ -148,6 +149,8 @@ export function presentDisplay(
   opts: { slow?: boolean; activeCount?: number } = {},
 ): StatusView {
   switch (state) {
+    case 'OFF':
+      return { text: 'Proxy: OFF', icon: '$(debug-stop)', accessLabel: 'Proxy off', level: 'normal' };
     case 'HEALTHY':
       return opts.slow
         ? {

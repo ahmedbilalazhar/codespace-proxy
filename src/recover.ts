@@ -176,6 +176,8 @@ export async function waitForTaskStopped(
 }
 
 export interface ReviveTaskDeps {
+  /** Explicit proxy-off veto also applies after we stopped a stuck task. */
+  canContinue?: () => boolean;
   exec: ExecAsync;
   probe: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
   sleep: (ms: number) => Promise<void>;
@@ -245,6 +247,7 @@ export async function reviveScheduledTask(
     deps.onProgress?.(plan.reason);
   }
 
+  if (deps.canContinue && !deps.canContinue()) return { ok: false, detail: 'proxy was turned off during recovery' };
   if (!stoppedByUs && deps.canStart && !deps.canStart()) {
     return { ok: false, detail: 'auto-recovery was disabled while checking the task' };
   }

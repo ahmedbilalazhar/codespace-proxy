@@ -19,7 +19,7 @@ describe('proc stability', () => {
   const cfg: ProxyProcConfig = {
     ...DEFAULT_PROC_CONFIG,
     sshExe: 'C:\\Windows\\System32\\OpenSSH\\ssh.exe',
-    hptsCmd: '%USERPROFILE%\\npm-global\\hpts.cmd',
+    hptsCmd: 'C:\\Users\\Proxy User\\npm-global\\hpts.cmd',
     ec2Host: '16.192.228.28',
     socksPort: 1080,
     httpPort: 8080,
@@ -59,8 +59,7 @@ describe('proc stability', () => {
     const call = captured[0];
     assert.equal(call.exe.toLowerCase(), 'cmd.exe');
     assert.deepEqual(call.args.slice(0, 3), ['/d', '/s', '/c']);
-    assert.ok(call.args[3].toLowerCase().endsWith('hpts.cmd'));
-    assert.deepEqual(call.args.slice(4), ['-p', '8080', '-s', '127.0.0.1:1080']);
+    assert.match(call.args[3], /^"".*hpts\.cmd" "-p" "8080" "-s" "127\.0\.0\.1:1080""$/i);
   });
 
   it('non-batch hpts command is spawned directly without wrapper', () => {

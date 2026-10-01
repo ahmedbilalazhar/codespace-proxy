@@ -1,3 +1,65 @@
+# OpenCode Proxy Health (v0.11.0)
+
+## Turn the proxy off and back on
+
+Open the VS Code Command Palette (`Ctrl+Shift+P`) and run
+**OpenCode Proxy: Turn Proxy Off Safely**, or click the proxy status icon and
+choose **Turn proxy off safely**. This pauses monitoring, startup recovery,
+network repair, and manual recovery; drains pending work; disables and ends
+the configured retry tasks; stops only matching HTTP bridge/SSH processes;
+and verifies the proxy ports are closed. The off state persists across
+VS Code restarts and configuration changes. Terminals started by this
+extension are closed, ending any requests running in them.
+
+If shutdown cannot be verified, the status says **OFF (shutdown incomplete)**
+and the output log explains why. Recovery stays paused; fix the reported
+permissions/process problem and run the off command again. Foreign processes
+are never killed to free a port.
+
+To resume, run **OpenCode Proxy: Turn Proxy On** or use the dashboard. In
+legacy task mode, only tasks this extension disabled are re-enabled. In
+direct mode, legacy tasks stay disabled to avoid competing supervisors.
+
+The extension does not change machine-wide proxy settings. Other applications
+and existing terminals with proxy settings need those settings cleared before
+they can connect directly. In a PowerShell terminal, clear this session's
+proxy environment with:
+
+```powershell
+'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy' |
+  ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+```
+
+## Reliability fixes in v0.11.0
+
+- Successful automatic recovery no longer waits on its own health check and
+  freezes monitoring. Failed attempts record their cooldown and retry budget.
+- `autoRecover: false` now suppresses direct background recovery as well as
+  legacy task recovery. `bootstrapRecoverOnStartup` remains a separate startup
+  option. Manual network checks verify/repair even on the first check or when
+  the public IP has not changed.
+- SOCKS replies retain combined TCP packets; handshake/CONNECT timeouts no
+  longer count as connectivity. Chunked HTTP echo responses are decoded.
+- Echo-service failures are classified before any tunnel restart. A working
+  owned tunnel is retained; a known wrong egress IP cannot pass as healthy.
+- Closed-port stale processes are stopped before replacement; a listening
+  owned bridge that cannot forward is refreshed once and re-verified.
+- Process matching uses exact flag values, ports, and SSH targets so shutdown
+  cannot mistake a similarly named or numbered process for this proxy.
+- Custom SSH ports are passed to the tunnel. Windows batch paths with spaces
+  are quoted, missing executables cannot crash the extension host, and the
+  legacy bridge launcher uses `call` so its retry loop can resume.
+
+Build and run regression checks with `npm ci` then `npm test`. Package the
+extension with `npx @vscode/vsce package --no-dependencies`, install the
+resulting VSIX using **Extensions: Install from VSIX**, and reload VS Code.
+The extension manages Windows processes; the test suite also runs on Linux.
+GitHub Actions covers both platforms, including a real Windows batch-launch
+check. Live AWS/key configuration still needs to be verified on your Windows
+machine using **Recover Proxy** and the output log.
+
+---
+
 # OpenCode Proxy Health (v0.10.2 — zombie-tunnel migration from old builds)
 
 ## v0.10.2 — the old build's tunnel is now replaceable

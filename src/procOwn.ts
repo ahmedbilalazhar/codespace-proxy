@@ -28,6 +28,7 @@ import { execFile } from 'child_process';
 import { redactCommandLine, type ExecAsync } from './diagnose';
 import { parseNetstatListeners } from './diagnose';
 import { AWS_ELASTIC_IP } from './netModel';
+import { win32 } from 'path';
 
 export interface ProxyProcConfig {
   sshExe: string;
@@ -36,6 +37,7 @@ export interface ProxyProcConfig {
   ec2Host: string;
   socksHost: string;
   socksPort: number;
+  sshPort?: number;
   hptsCmd: string;
   httpPort: number;
 }
@@ -80,6 +82,8 @@ export function buildSshArgs(cfg: ProxyProcConfig): string[] {
     '-D',
     `${cfg.socksHost}:${cfg.socksPort}`,
     '-N',
+    '-p',
+    String(cfg.sshPort ?? 22),
     '-o',
     'ServerAliveInterval=30',
     '-o',
@@ -109,67 +113,37 @@ export function buildHptsArgs(cfg: ProxyProcConfig): string[] {
  * ssh.exe, -D <host>:<port> (or -D <port> legacy), -N, and user@ec2Host.
  * A bare `ssh.exe` with no flags never matches. Pure.
  */
+function tokens(cmdline: string): string[] {
+  return (cmdline.match(/"[^"]*"|[^\s"]+/g) ?? []).map((v) => v.replace(/^"|"$/g, ''));
+}
+
+function option(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  if (i >= 0) return args[i + 1];
+  return args.find((v) => v.startsWith(flag) && v.length > flag.length)?.slice(flag.length);
+}
+
+function sshShape(args: string[], cfg: ProxyProcConfig): boolean {
+  if (!/^ssh(?:\.exe)?$/i.test(win32.basename(args[0] ?? ''))) return false;
+  const bind = option(args, '-D');
+  return args.includes('-N') && (bind === String(cfg.socksPort) || bind === `${cfg.socksHost}:${cfg.socksPort}`);
+}
+
 export function isOurSshCmdline(cmdline: string, cfg: ProxyProcConfig): boolean {
-  const c = cmdline.toLowerCase();
-  if (!c.includes('ssh')) {
-    return false;
-  }
-  const wantsHost = `${cfg.socksHost}:${cfg.socksPort}`.toLowerCase();
-  const legacyD = `-d ${cfg.socksPort}`;
-  const modernD = `-d ${wantsHost}`;
-  const hasD = c.includes(modernD) || c.includes(legacyD) || c.includes(`-d${cfg.socksPort}`);
-  if (!hasD) {
-    return false;
-  }
-  if (!/(^|\s)-n(\s|$)/.test(c)) {
-    return false;
-  }
-  const target = `${cfg.sshUser}@${cfg.ec2Host}`.toLowerCase();
-  if (!c.includes(target)) {
-    return false;
-  }
-  return true;
+  const args = tokens(cmdline);
+  return sshShape(args, cfg) && args.includes(`${cfg.sshUser}@${cfg.ec2Host}`);
 }
 
-/**
- * Migration matcher: same port/flags discipline as isOurSshCmdline, but the
- * target host is any legacy proxy host with ANY user. A tunnel spawned by an
- * older build of this extension (wrong/old Elastic IP) is ours to manage —
- * detectable, killable, replaceable — never "foreign". Pure.
- */
 export function isLegacyProxySshCmdline(cmdline: string, cfg: ProxyProcConfig): boolean {
-  const c = cmdline.toLowerCase();
-  if (!c.includes('ssh')) {
-    return false;
-  }
-  const wantsHost = `${cfg.socksHost}:${cfg.socksPort}`.toLowerCase();
-  const hasD =
-    c.includes(`-d ${wantsHost}`) ||
-    c.includes(`-d ${cfg.socksPort}`) ||
-    c.includes(`-d${cfg.socksPort}`);
-  if (!hasD) {
-    return false;
-  }
-  if (!/(^|\s)-n(\s|$)/.test(c)) {
-    return false;
-  }
-  return LEGACY_PROXY_HOSTS.some((h) => c.includes(`@${h}`));
+  const args = tokens(cmdline);
+  return sshShape(args, cfg) && LEGACY_PROXY_HOSTS.some((h) => args.includes(`${cfg.sshUser}@${h}`));
 }
 
-/** Does this command line belong to OUR hpts bridge? Pure. */
 export function isOurHptsCmdline(cmdline: string, cfg: ProxyProcConfig): boolean {
-  const c = cmdline.toLowerCase();
-  if (!(c.includes('http-proxy-to-socks') || c.includes('hpts'))) {
-    return false;
-  }
-  const socksFrag = `${cfg.socksHost}:${cfg.socksPort}`.toLowerCase();
-  if (!c.includes(socksFrag) && !c.includes(`:${cfg.socksPort}`)) {
-    return false;
-  }
-  if (!c.includes(`-p`) || !c.includes(String(cfg.httpPort))) {
-    return false;
-  }
-  return true;
+  const args = tokens(cmdline);
+  const isBridge = args.some((v) => /(?:^|[\\/])(?:http-proxy-to-socks|hpts)(?:[\\/.]|$)/i.test(v));
+  return isBridge && option(args, '-p') === String(cfg.httpPort) &&
+    option(args, '-s') === `${cfg.socksHost}:${cfg.socksPort}`;
 }
 
 interface CimRow {
@@ -178,7 +152,7 @@ interface CimRow {
   CommandLine?: string | null;
 }
 
-function asRows(json: string): CimRow[] {
+export function asRows(json: string): CimRow[] {
   const t = json.trim();
   if (!t) {
     return [];
@@ -200,8 +174,8 @@ function defaultExec(file: string, args: string[], timeoutMs: number): Promise<s
   });
 }
 
-const CIM_PS =
-  `Get-CimInstance Win32_Process -Filter "Name='ssh.exe' or Name='node.exe'" | ` +
+export const CIM_PS =
+  `$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter "Name='ssh.exe' or Name='node.exe'" | ` +
   `Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress -Depth 2`;
 
 /** List OUR ssh.exe processes (exact cmdline match). Never throws. */
@@ -380,7 +354,7 @@ export async function dedupOurHpts(
 export type SpawnFn = (
   exe: string,
   args: string[],
-  opts: { detached: boolean; windowsHide: boolean },
+  opts: { detached: boolean; windowsHide: boolean; windowsVerbatimArguments?: boolean },
 ) => { pid: number | null; error?: string };
 
 /**
@@ -400,14 +374,20 @@ export function launchResolved(
   const lower = exe.trim().toLowerCase();
   const isBatch = lower.endsWith('.cmd') || lower.endsWith('.bat');
   const finalExe = isBatch ? 'cmd.exe' : exe;
-  const finalArgs = isBatch ? ['/d', '/s', '/c', exe, ...args] : args;
-  return spawnFn(finalExe, finalArgs, { detached: true, windowsHide: true });
+  // cmd.exe needs one quoted command string, including outer /s quotes.
+  // Reject expansion characters even inside quotes rather than reinterpreting paths.
+  if (isBatch && [exe, ...args].some((v) => /["%!\r\n]/.test(v))) {
+    return { pid: null, error: 'batch path/arguments contain unsupported expansion characters' };
+  }
+  const command = '"' + [exe, ...args].map((v) => `"${v}"`).join(' ') + '"';
+  const finalArgs = isBatch ? ['/d', '/s', '/c', command] : args;
+  return spawnFn(finalExe, finalArgs, { detached: true, windowsHide: true, windowsVerbatimArguments: isBatch });
 }
 
 function rawSpawn(
   exe: string,
   args: string[],
-  opts: { detached: boolean; windowsHide: boolean },
+  opts: { detached: boolean; windowsHide: boolean; windowsVerbatimArguments?: boolean },
 ): { pid: number | null; error?: string } {
   try {
     const child: ChildProcess = spawn(exe, args, {
@@ -415,6 +395,8 @@ function rawSpawn(
       stdio: 'ignore',
       shell: false,
     });
+    // ENOENT/EACCES are emitted asynchronously; an unhandled error kills the host.
+    child.once('error', () => {});
     child.unref?.();
     return { pid: typeof child.pid === 'number' ? child.pid : null };
   } catch (e) {
