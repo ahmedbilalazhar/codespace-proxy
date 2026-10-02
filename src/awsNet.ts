@@ -11,10 +11,10 @@
  * - NEVER hardcode AWS credentials. All SG mutations go through the
  *   machine's existing AWS CLI configuration (profile/region/env), which the
  *   user already trusts. No access keys in source, logs, or settings.
- * - Least privilege: only TCP 22 /32 rules tagged/created by this proxy are
+ * - Least privilege: only configured SSH-port /32 rules marked for this proxy are
  *   touched. Never opens 0.0.0.0/0 automatically. Duplicates are avoided by
- *   describing first, then revoking stale + authorizing current, then
- *   verifying.
+ *   describing first, then authorizing and verifying current access before
+ *   revoking stale managed rules.
  *
  * Zero runtime dependencies; Windows-compatible; every function bounded by
  * timeouts and injectable for unit tests.
@@ -66,7 +66,11 @@ export type FetchDirect = (url: string, timeoutMs: number) => Promise<string>;
  * DIRECT fetch of one URL, ALWAYS bypassing HTTP_PROXY/HTTPS_PROXY.
  * Node http/https do not auto-use proxy env, but we enforce the bypass
  * explicitly: snapshot + delete proxy vars for the duration of the request
- * (restored afterwards) and use a dedicated no-proxy agent. This function
+ * (restored afterwards) and use a dedicated no-proxy agent. Construct the
+ * ClientRequest directly: VS Code patches http/https.get and .request and
+ * can replace even an explicit agent when http.proxySupport is "override".
+ * Bootstrap networking must not depend on the proxy it is repairing.
+ * This function
  * never touches 127.0.0.1:8080 or 127.0.0.1:1080.
  */
 const PROXY_ENV_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
@@ -138,20 +142,30 @@ export function fetchDirectUrl(url: string, timeoutMs: number): Promise<string> 
     let u: URL;
     try {
       u = new URL(url);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('unsupported protocol');
     } catch {
       restore();
       reject(new Error(`bad direct IP URL: ${url}`));
       return;
     }
-    const lib = u.protocol === 'https:' ? https : http;
     const agent = u.protocol === 'https:' ? new https.Agent({ keepAlive: false }) : new http.Agent({ keepAlive: false });
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
     const done = (fn: () => void) => {
+      // end/error/timeout can arrive for the same request. Release its bypass
+      // exactly once, and cancel its deadline so it cannot release a later poll.
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      agent.destroy();
       restore();
       fn();
     };
-    const req = lib.get(
-      url,
-      { timeout: timeoutMs, headers: { 'User-Agent': 'opencode-proxy-health' }, agent },
+    let req: http.ClientRequest;
+    try { req = new http.ClientRequest(
+      { protocol: u.protocol, hostname: u.hostname, port: u.port || undefined,
+        path: `${u.pathname}${u.search}`, method: 'GET',
+        timeout: timeoutMs, family: 4, headers: { 'User-Agent': 'opencode-proxy-health' }, agent },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();
@@ -168,21 +182,25 @@ export function fetchDirectUrl(url: string, timeoutMs: number): Promise<string> 
           }
         });
         res.on('end', () => done(() => resolve(body.trim())));
+        res.on('error', (e) => done(() => reject(e)));
+        res.on('aborted', () => done(() => reject(new Error('direct IP response aborted'))));
       },
-    );
+    ); } catch (e) { done(() => reject(e)); return; }
     req.on('timeout', () => {
       req.destroy();
       done(() => reject(new Error(`timed out after ${timeoutMs}ms fetching ${url} directly (proxy bypassed)`)));
     });
     req.on('error', (e) => done(() => reject(e as Error)));
-    setTimeout(() => {
+    req.end();
+    timer = setTimeout(() => {
       try {
         req.destroy();
       } catch {
         /* ignore */
       }
       done(() => reject(new Error(`timed out after ${timeoutMs}ms fetching ${url} directly (proxy bypassed)`)));
-    }, timeoutMs + 1000).unref?.();
+    }, timeoutMs + 1000);
+    timer.unref?.();
   });
 }
 
@@ -199,10 +217,10 @@ export async function fetchDirectPublicIp(
   for (const url of urls) {
     try {
       const ip = (await fetchOne(url, timeoutMs)).trim();
-      if (isPlausibleIp(ip)) {
+      if (isPlausibleIp(ip) && !ip.includes(':')) {
         return { ip, service: url };
       }
-      errors.push(`${url} answered a non-IP body`);
+      errors.push(`${url} did not answer with a public IPv4 address`);
     } catch (e) {
       errors.push(`${url}: ${(e as Error).message.split('\n')[0].slice(0, 160)}`);
     }
@@ -246,11 +264,28 @@ function firstLine(s: string): string {
  * (ENOENT) — route through cmd.exe. Real .exe installs also work via cmd.
  * All args are ours (group ids, CIDRs, flags); no shell metacharacters.
  */
-function runAws(exec: ExecAsync, args: string[], timeoutMs: number): Promise<string> {
-  if (process.platform === 'win32') {
-    return exec('cmd.exe', ['/d', '/c', 'aws', ...args], timeoutMs);
+export function awsCliInvocation(args: string[], platform: string = process.platform): { file: string; args: string[] } {
+  if (platform === 'win32') {
+    // Profile/region/group settings are user input. cmd.exe expands %VAR%
+    // and interprets metacharacters even though execFile itself uses no shell.
+    if (args.some((arg) => /["%!&|<>^\r\n]/.test(arg))) {
+      throw new Error('AWS CLI settings contain unsupported Windows command expansion characters');
+    }
+    return { file: 'cmd.exe', args: ['/d', '/v:off', '/c', 'aws', ...args] };
   }
-  return exec('aws', args, timeoutMs);
+  return { file: 'aws', args };
+}
+
+function runAws(exec: ExecAsync, args: string[], timeoutMs: number): Promise<string> {
+  const invocation = awsCliInvocation(args);
+  // Repair must reach AWS while the tunnel is down. Strip proxies from the
+  // child's environment only; preserve the existing AWS profile and credentials.
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (PROXY_ENV_VARS.some((proxyKey) => proxyKey.toLowerCase() === key.toLowerCase())) delete env[key];
+  }
+  env.NO_PROXY = '*';
+  return exec(invocation.file, invocation.args, timeoutMs, { env });
 }
 
 /** Describe TCP-22 ingress rules on the SG. Never throws — failures are data. */
@@ -277,8 +312,9 @@ export async function describeSshRules(
   ];
   try {
     const out = await runAws(exec, args, Math.min(cfg.checkTimeoutMs + 7000, 15000));
-    const rules = parseSshPermissions(out, cfg.securityGroupId.trim());
-    return { ok: true, rules, detail: `${rules.length} TCP-22 rule(s) on ${cfg.securityGroupId.trim()}` };
+    if (!Array.isArray(JSON.parse(out))) throw new Error('invalid security-group permissions response');
+    const rules = parseSshPermissions(out, cfg.securityGroupId.trim(), cfg.sshPort);
+    return { ok: true, rules, detail: `${rules.length} TCP-${cfg.sshPort} rule(s) on ${cfg.securityGroupId.trim()}` };
   } catch (e) {
     return { ok: false, rules: [], detail: `describe-security-groups failed: ${firstLine((e as Error).message)}` };
   }
@@ -290,7 +326,7 @@ export async function describeSshRules(
  * -1/-1). Pure. Non-SSH permissions (HTTP, etc.) are ignored so repair never
  * touches unrelated rules.
  */
-export function parseSshPermissions(json: string, groupId: string): SshRule[] {
+export function parseSshPermissions(json: string, groupId: string, port = 22): SshRule[] {
   const out: SshRule[] = [];
   try {
     const parsed: unknown = JSON.parse(json.trim() === '' ? '[]' : json);
@@ -300,7 +336,7 @@ export function parseSshPermissions(json: string, groupId: string): SshRule[] {
         continue;
       }
       const rec = perm as Record<string, unknown>;
-      if (!coversTcp22(rec.IpProtocol, rec.FromPort, rec.ToPort)) {
+      if (!coversTcpPort(rec.IpProtocol, rec.FromPort, rec.ToPort, port)) {
         continue;
       }
       const ranges = rec.IpRanges;
@@ -329,7 +365,7 @@ export function parseSshPermissions(json: string, groupId: string): SshRule[] {
 }
 
 /** True when an IpPermission covers inbound TCP 22. Pure. */
-function coversTcp22(proto: unknown, from: unknown, to: unknown): boolean {
+function coversTcpPort(proto: unknown, from: unknown, to: unknown, port: number): boolean {
   if (proto === '-1') {
     return true; // all traffic includes TCP 22
   }
@@ -339,7 +375,7 @@ function coversTcp22(proto: unknown, from: unknown, to: unknown): boolean {
   if (typeof from !== 'number' || typeof to !== 'number') {
     return false;
   }
-  return from <= 22 && 22 <= to;
+  return from <= port && port <= to;
 }
 
 /** Is this a /32 rule created by this proxy (safe to replace)? Pure. */
@@ -376,9 +412,9 @@ export interface SgUpdateResult {
  * Safely replace stale SSH /32 rules with the current IP /32:
  *   1. describe first (no blind adds, no duplicates),
  *   2. if current IP already authorized -> verify-only, no mutation,
- *   3. revoke stale proxy-managed /32s (never 0.0.0.0/0, never foreign rules),
- *   4. authorize current IP /32 with Description "opencode-proxy SSH <date>",
- *   5. describe again to verify.
+ *   3. authorize current IP /32 with Description "opencode-proxy",
+ *   4. describe again to verify before removing any old access,
+ *   5. revoke stale proxy-managed /32s (never 0.0.0.0/0, never foreign rules).
  *
  * Never opens 0.0.0.0/0. Never touches non-/32 or non-proxy rules.
  */
@@ -402,18 +438,6 @@ export async function ensureSshAccess(
     return { ok: true, detail: `${currentIp}/32 already authorized on ${gid} — no change`, authorizedCurrent: true, revoked: [] };
   }
   const revoked: string[] = [];
-  for (const stale of staleProxyRules(before.rules, currentIp)) {
-    try {
-      await runAws(
-        exec,
-        ['ec2', 'revoke-security-group-ingress', '--group-id', gid, '--protocol', 'tcp', '--port', '22', '--cidr', stale.cidr, ...awsBaseArgs(cfg)],
-        15000,
-      );
-      revoked.push(stale.cidr);
-    } catch (e) {
-      return { ok: false, detail: `revoke ${stale.cidr} failed: ${firstLine((e as Error).message)}`, authorizedCurrent: false, revoked };
-    }
-  }
   try {
     await runAws(
       exec,
@@ -422,32 +446,17 @@ export async function ensureSshAccess(
         'authorize-security-group-ingress',
         '--group-id',
         gid,
-        '--protocol',
-        'tcp',
-        '--port',
-        '22',
-        '--cidr',
-        `${currentIp}/32`,
-        '--tag-specifications',
-        `ResourceType=security-group-rule,Tags=[{Key=Name,Value=${PROXY_TAG}}]`,
+        '--ip-permissions',
+        // No whitespace/quotes: also passed through cmd.exe on Windows.
+        // The description is returned by describe-security-groups, unlike tags.
+        `IpProtocol=tcp,FromPort=${cfg.sshPort},ToPort=${cfg.sshPort},IpRanges=[{CidrIp=${currentIp}/32,Description=${PROXY_TAG}}]`,
         ...awsBaseArgs(cfg),
       ],
       15000,
     );
   } catch (e) {
-    // Fallback without tag-specifications (older CLI / permissions without tagging).
     const msg = firstLine((e as Error).message);
-    if (/tag-specification|tagging|unauthorized.*tag/i.test(msg)) {
-      try {
-        await runAws(
-          exec,
-          ['ec2', 'authorize-security-group-ingress', '--group-id', gid, '--protocol', 'tcp', '--port', '22', '--cidr', `${currentIp}/32`, ...awsBaseArgs(cfg)],
-          15000,
-        );
-      } catch (e2) {
-        return { ok: false, detail: `authorize ${currentIp}/32 failed: ${firstLine((e2 as Error).message)}`, authorizedCurrent: false, revoked };
-      }
-    } else if (/already exists|duplicate/i.test(msg)) {
+    if (/already exists|duplicate/i.test(msg)) {
       // Race: someone else added it — verify below.
     } else {
       return { ok: false, detail: `authorize ${currentIp}/32 failed: ${msg}`, authorizedCurrent: false, revoked };
@@ -458,8 +467,21 @@ export async function ensureSshAccess(
     return { ok: false, detail: `authorized ${currentIp}/32 but verification describe failed: ${after.detail}`, authorizedCurrent: false, revoked };
   }
   if (authorizesIp(after.rules, currentIp)) {
+    const warnings: string[] = [];
+    // Only remove rules seen both before and after authorizing our replacement.
+    const staleBefore = new Set(staleProxyRules(before.rules, currentIp).map((r) => r.cidr));
+    for (const stale of staleProxyRules(after.rules, currentIp).filter((r) => staleBefore.has(r.cidr))) {
+      try {
+        await runAws(exec,
+          ['ec2', 'revoke-security-group-ingress', '--group-id', gid, '--protocol', 'tcp', '--port', String(cfg.sshPort), '--cidr', stale.cidr, ...awsBaseArgs(cfg)],
+          15000);
+        revoked.push(stale.cidr);
+      } catch (e) {
+        warnings.push(`stale ${stale.cidr} retained: ${firstLine((e as Error).message)}`);
+      }
+    }
     const extra = revoked.length > 0 ? ` (revoked stale ${revoked.join(', ')})` : '';
-    return { ok: true, detail: `authorized ${currentIp}/32 on ${gid}${extra} — verified`, authorizedCurrent: true, revoked };
+    return { ok: true, detail: `authorized ${currentIp}/32 on ${gid}${extra} — verified${warnings.length ? `; cleanup warning: ${warnings.join('; ')}` : ''}`, authorizedCurrent: true, revoked };
   }
   return { ok: false, detail: `authorize appeared to succeed but ${currentIp}/32 not present on re-check`, authorizedCurrent: false, revoked };
 }

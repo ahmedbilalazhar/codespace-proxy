@@ -14,7 +14,8 @@
 
 import { execFile } from 'child_process';
 
-export type ExecAsync = (file: string, args: string[], timeoutMs: number) => Promise<string>;
+export interface ExecOptions { env?: NodeJS.ProcessEnv; }
+export type ExecAsync = (file: string, args: string[], timeoutMs: number, options?: ExecOptions) => Promise<string>;
 
 export const SSH_TASK_NAME = 'OpenCode SSH SOCKS5';
 export const BRIDGE_TASK_NAME = 'OpenCode HTTP Proxy Bridge';
@@ -128,9 +129,9 @@ export function parseNetstatListeners(stdout: string, ports: number[]): PortList
   return out;
 }
 
-function defaultExec(file: string, args: string[], timeoutMs: number): Promise<string> {
+function defaultExec(file: string, args: string[], timeoutMs: number, options?: ExecOptions): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+    execFile(file, args, { ...options, timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
       if (err) {
         reject(err);
       } else {

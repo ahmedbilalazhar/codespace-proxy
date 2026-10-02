@@ -2,7 +2,7 @@
   "name": "opencode-proxy-health",
   "displayName": "OpenCode Proxy Health",
   "description": "VS Code status-bar monitor for the OpenCode SSH SOCKS5 + HTTP bridge + Zen/Muse Spark chain, with one-click recovery runbook and opt-in self-healing.",
-  "version": "0.11.0",
+  "version": "0.11.3",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -346,7 +346,7 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "description": "Seconds between automatic direct public-IP polls (proxy bypassed). 0 (default) = MANUAL mode: polling is off, the proxy is never disturbed on a stable network; use 'Check Network / Repair SG Now' after a Wi-Fi change. Set >0 only if you roam constantly and want automatic detection."
+          "description": "Seconds between direct public-IP polls (proxy bypassed; minimum effective interval 30s). 0 disables polling. For automatic Wi-Fi recovery set 30, autoRecover=true, supervisorMode=direct, and configure securityGroupId + local AWS CLI access. Proxy Off pauses all checks and repair."
         },
         "opencodeProxyHealth.recoveryMaxAttempts": {
           "type": "number",
@@ -384,11 +384,16 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node scripts/test.cjs",
-    "demo": "npm run compile && node scripts/demo-status.cjs"
+    "demo": "npm run compile && node scripts/demo-status.cjs",
+    "package": "npm run compile && npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ahmedbilalazhar/codespace-proxy.git"
   }
 }

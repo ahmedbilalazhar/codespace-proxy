@@ -52,7 +52,19 @@ it('SOCKS HTTP echoes decode chunked response bodies', async () => {
       s.write(Buffer.from([5, 0]));
       s.once('data', () => {
         s.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]));
-        s.once('data', () => s.end('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n16.192\r\n7\r\n.228.28\r\n0\r\n\r\n'));
+        s.once('data', () => s.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n6\r\n16.192\r\n7\r\n.228.28\r\n0\r\n\r\n'));
+      });
+    });
+  }, async (p) => assert.equal(await fetchViaSocks5('127.0.0.1', p, 'echo.test', 80, '/', 1000), '16.192.228.28'));
+});
+
+it('SOCKS content-length echoes complete without waiting for TCP close', async () => {
+  await serverTest((s) => {
+    s.once('data', () => {
+      s.write(Buffer.from([5, 0]));
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 80]));
+        s.once('data', () => s.write('HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n16.192.228.28'));
       });
     });
   }, async (p) => assert.equal(await fetchViaSocks5('127.0.0.1', p, 'echo.test', 80, '/', 1000), '16.192.228.28'));

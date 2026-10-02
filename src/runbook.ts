@@ -157,7 +157,8 @@ function makeStep(id: StepId, now: number): StepState {
 
 /**
  * Poll `probePort` until it answers or the budget runs out. Always performs at
- * least one probe, and always resolves — a probe that throws counts as "down".
+ * least one probe unless process failure is already known. A probe that throws
+ * counts as "down". Process exit evidence ends the wait immediately.
  */
 export async function waitForPort(
   probe: (host: string, port: number, timeoutMs: number) => Promise<boolean>,
@@ -168,10 +169,13 @@ export async function waitForPort(
   probeTimeoutMs: number,
   sleep: (ms: number) => Promise<void>,
   now: () => number,
-): Promise<{ up: boolean; waitedMs: number; probes: number }> {
+  processFailure?: () => string | null,
+): Promise<{ up: boolean; waitedMs: number; probes: number; failure?: string }> {
   const started = now();
   let probes = 0;
   for (;;) {
+    const early = processFailure?.();
+    if (early) return { up: false, waitedMs: now() - started, probes, failure: early };
     probes += 1;
     let up = false;
     try {
@@ -179,6 +183,8 @@ export async function waitForPort(
     } catch {
       up = false;
     }
+    const exited = processFailure?.();
+    if (exited) return { up: false, waitedMs: now() - started, probes, failure: exited };
     if (up) {
       return { up: true, waitedMs: now() - started, probes };
     }

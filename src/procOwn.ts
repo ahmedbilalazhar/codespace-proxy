@@ -29,6 +29,7 @@ import { redactCommandLine, type ExecAsync } from './diagnose';
 import { parseNetstatListeners } from './diagnose';
 import { AWS_ELASTIC_IP } from './netModel';
 import { win32 } from 'path';
+import { accessSync, constants, statSync } from 'fs';
 
 export interface ProxyProcConfig {
   sshExe: string;
@@ -97,6 +98,8 @@ export function buildSshArgs(cfg: ProxyProcConfig): string[] {
     // Refuse silent password prompts: a spawned tunnel must never sit at an
     // invisible prompt; if the key is rejected it must die and be reported.
     'BatchMode=yes',
+    '-o',
+    'IdentitiesOnly=yes',
     '-o',
     'ExitOnForwardFailure=yes',
     `${cfg.sshUser}@${cfg.ec2Host}`,
@@ -351,11 +354,73 @@ export async function dedupOurHpts(
   return { kept: keep.pid, killed, detail: `dedup hpts: kept pid ${keep.pid}, killed [${killed.join(', ') || 'none'}]` };
 }
 
+export interface ChildStatus {
+  exited: boolean;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  error?: string;
+}
+
+export interface SpawnResult {
+  pid: number | null;
+  error?: string;
+  status?: () => ChildStatus;
+}
+
+export interface ProxySpawnResult extends SpawnResult {
+  ok: boolean;
+  detail: string;
+}
+
 export type SpawnFn = (
   exe: string,
   args: string[],
   opts: { detached: boolean; windowsHide: boolean; windowsVerbatimArguments?: boolean },
-) => { pid: number | null; error?: string };
+) => SpawnResult;
+
+/** Keep bounded stderr and exit evidence without retaining the process handle. */
+export function observeChild(child: ChildProcess): () => ChildStatus {
+  const state: ChildStatus = { exited: false, exitCode: null, signal: null, stderr: '' };
+  child.stderr?.on('data', (data: Buffer) => { state.stderr = (state.stderr + data.toString('utf8')).slice(-4096); });
+  child.once('error', (error: NodeJS.ErrnoException) => {
+    state.exited = true;
+    state.error = error.code ?? error.message;
+  });
+  child.once('exit', (code, signal) => { state.exited = true; state.exitCode = code; state.signal = signal; });
+  return () => ({ ...state });
+}
+
+/** Never persist a private-key path, even when SSH quotes it in an error. */
+export function redactLaunchOutput(text: string, keyPath = ''): string {
+  let safe = text;
+  const expanded = expandEnv(keyPath);
+  for (const path of [expanded, expanded.replace(/\\/g, '/'), keyPath]) {
+    if (path) safe = safe.split(path).join('<redacted-key-path>');
+  }
+  return safe.split(/\r?\n/).map(redactCommandLine).join(' | ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 1800).trim();
+}
+
+export function startupFailure(label: string, launched: SpawnResult): string | null {
+  const status = launched.status?.();
+  if (!status?.exited) return null;
+  const exit = status.error ? `could not start (${status.error})` :
+    status.signal ? `terminated by ${status.signal}` : `exited with code ${status.exitCode ?? 'unknown'}`;
+  const error = status.stderr.trim();
+  let help = '';
+  if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(error)) {
+    help = ' Verify the server fingerprint using AWS, then establish trust with an interactive SSH connection; host verification remains enabled.';
+  } else if (/UNPROTECTED PRIVATE KEY FILE|bad permissions|permissions.*too open/i.test(error)) {
+    help = ' Fix the configured key file ACL so only its owner can read it.';
+  } else if (/Permission denied|sign_and_send_pubkey|incorrect passphrase/i.test(error)) {
+    help = ' Check sshUser and sshKeyPath against the EC2 instance; load a passphrase-protected key into ssh-agent before retrying.';
+  } else if (/Identity file.*not accessible|No such file|Load key.*(invalid format|error in libcrypto)/i.test(error)) {
+    help = ' Correct opencodeProxyHealth.sshKeyPath to a readable, valid OpenSSH private key.';
+  } else if (/Address already in use|cannot listen to port/i.test(error)) {
+    help = ' Resolve the local port conflict before retrying; unrelated listeners are never killed.';
+  }
+  return `${label} ${exit}${error ? `: ${error}` : '; no stderr captured'}.${help}`;
+}
 
 /**
  * Launch exe with args. Stability fix for .cmd/.bat targets: since Node 18
@@ -370,7 +435,7 @@ export function launchResolved(
   exe: string,
   args: string[],
   spawnFn: SpawnFn = rawSpawn,
-): { pid: number | null; error?: string } {
+): SpawnResult {
   const lower = exe.trim().toLowerCase();
   const isBatch = lower.endsWith('.cmd') || lower.endsWith('.bat');
   const finalExe = isBatch ? 'cmd.exe' : exe;
@@ -388,17 +453,18 @@ function rawSpawn(
   exe: string,
   args: string[],
   opts: { detached: boolean; windowsHide: boolean; windowsVerbatimArguments?: boolean },
-): { pid: number | null; error?: string } {
+): SpawnResult {
   try {
     const child: ChildProcess = spawn(exe, args, {
       ...opts,
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
       shell: false,
     });
-    // ENOENT/EACCES are emitted asynchronously; an unhandled error kills the host.
-    child.once('error', () => {});
+    const status = observeChild(child);
+    // Detach the diagnostic pipe as well as the child handle.
+    (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
     child.unref?.();
-    return { pid: typeof child.pid === 'number' ? child.pid : null };
+    return { pid: typeof child.pid === 'number' ? child.pid : null, status };
   } catch (e) {
     return { pid: null, error: (e as Error).message };
   }
@@ -408,17 +474,30 @@ function rawSpawn(
 export function spawnSsh(
   cfg: ProxyProcConfig,
   spawnFn: SpawnFn = rawSpawn,
-): { ok: boolean; pid: number | null; detail: string } {
+): ProxySpawnResult {
   const exe = expandEnv(cfg.sshExe);
   const args = buildSshArgs(cfg);
+  if (spawnFn === rawSpawn) {
+    try {
+      const key = expandEnv(cfg.sshKeyPath);
+      if (/%[^%]+%/.test(key) || !statSync(key).isFile()) throw new Error('not a key file');
+      accessSync(key, constants.R_OK);
+    } catch {
+      return { ok: false, pid: null, detail: 'SSH key is missing or unreadable. Set opencodeProxyHealth.sshKeyPath to your actual private key file (not the .pub file); the configured path is redacted.' };
+    }
+  }
   try {
     const r = launchResolved(exe, args, spawnFn);
+    const status = r.status ? () => {
+      const result = r.status!();
+      return { ...result, stderr: redactLaunchOutput(result.stderr, cfg.sshKeyPath), error: result.error ? redactLaunchOutput(result.error, cfg.sshKeyPath) : undefined };
+    } : undefined;
     if (r.pid && r.pid > 0) {
-      return { ok: true, pid: r.pid, detail: `ssh spawned (pid ${r.pid}) -D ${cfg.socksHost}:${cfg.socksPort} -> ${cfg.sshUser}@${cfg.ec2Host}` };
+      return { ok: true, pid: r.pid, status, detail: `ssh spawned (pid ${r.pid}) -D ${cfg.socksHost}:${cfg.socksPort} -> ${cfg.sshUser}@${cfg.ec2Host}` };
     }
-    return { ok: false, pid: null, detail: `ssh spawn failed: ${r.error ?? 'no pid'}` };
+    return { ok: false, pid: null, detail: `ssh spawn failed: ${redactLaunchOutput(r.error ?? 'no pid', cfg.sshKeyPath)}` };
   } catch (e) {
-    return { ok: false, pid: null, detail: `ssh spawn threw: ${(e as Error).message.slice(0, 160)}` };
+    return { ok: false, pid: null, detail: `ssh spawn threw: ${redactLaunchOutput((e as Error).message, cfg.sshKeyPath)}` };
   }
 }
 
@@ -426,16 +505,20 @@ export function spawnSsh(
 export function spawnHpts(
   cfg: ProxyProcConfig,
   spawnFn: SpawnFn = rawSpawn,
-): { ok: boolean; pid: number | null; detail: string } {
+): ProxySpawnResult {
   const exe = expandEnv(cfg.hptsCmd);
   const args = buildHptsArgs(cfg);
   try {
     const r = launchResolved(exe, args, spawnFn);
+    const status = r.status ? () => {
+      const result = r.status!();
+      return { ...result, stderr: redactLaunchOutput(result.stderr, cfg.sshKeyPath), error: result.error ? redactLaunchOutput(result.error, cfg.sshKeyPath) : undefined };
+    } : undefined;
     if (r.pid && r.pid > 0) {
-      return { ok: true, pid: r.pid, detail: `hpts spawned (pid ${r.pid}) -p ${cfg.httpPort} -s ${cfg.socksHost}:${cfg.socksPort}` };
+      return { ok: true, pid: r.pid, status, detail: `hpts spawned (pid ${r.pid}) -p ${cfg.httpPort} -s ${cfg.socksHost}:${cfg.socksPort}` };
     }
-    return { ok: false, pid: null, detail: `hpts spawn failed: ${r.error ?? 'no pid'}` };
+    return { ok: false, pid: null, detail: `hpts spawn failed: ${redactLaunchOutput(r.error ?? 'no pid', cfg.sshKeyPath)}` };
   } catch (e) {
-    return { ok: false, pid: null, detail: `hpts spawn threw: ${(e as Error).message.slice(0, 160)}` };
+    return { ok: false, pid: null, detail: `hpts spawn threw: ${redactLaunchOutput((e as Error).message, cfg.sshKeyPath)}` };
   }
 }

@@ -30,8 +30,8 @@ it('Windows batch launch preserves paths containing spaces and argument values',
 });
 
 it('missing executable reports failure without an unhandled child error', () => {
-  const code = `const {spawnSsh, DEFAULT_PROC_CONFIG} = require('./out/src/procOwn');
-    const r = spawnSsh({...DEFAULT_PROC_CONFIG, sshExe: 'missing-proxy-ssh-executable-9f734'});
-    if (r.ok) process.exitCode=1;`;
+  const code = `const {launchResolved} = require('./out/src/procOwn');
+    const r = launchResolved('missing-proxy-ssh-executable-9f734', []);
+    if (r.pid) process.exitCode=1;`;
   assert.doesNotThrow(() => execFileSync(process.execPath, ['-e', code], { cwd: process.cwd(), timeout: 5000 }));
 });

@@ -1,4 +1,145 @@
-# OpenCode Proxy Health (v0.11.0)
+# OpenCode Proxy Health (v0.11.3)
+
+## Install v0.11.3
+
+Download [opencode-proxy-health-0.11.3.vsix](releases/opencode-proxy-health-0.11.3.vsix)
+using GitHub's **Download raw file** button. In VS Code, run
+**Extensions: Install from VSIX**, select that file, and then run
+**Developer: Reload Window**. Confirm the OpenCode Proxy output log reports
+`version 0.11.3`. This updates the extension without merging unrelated Git
+histories or requiring a local build.
+
+This version includes SSH startup diagnostics, safe roaming security-group
+repair, and persistent Proxy Off controls. HTTP, HTTPS, and SOCKS probes now
+finish complete framed responses without waiting for the server to close its
+connection, preventing false timeouts on persistent connections. Partial or
+malformed responses remain failures. Windows AWS CLI arguments reject command
+expansion characters instead of letting settings be interpreted by cmd.exe.
+
+v0.11.3 also prevents VS Code's extension-host HTTP proxy wrappers from routing
+direct public-IP discovery through the tunnel. An explicit HTTP agent alone
+was insufficient with `http.proxySupport: "override"`. Discovery now constructs
+the native client request with a dedicated HTTP/TLS agent; HTTPS certificate
+verification stays enabled.
+AWS CLI repair subprocesses also receive a direct environment without inherited
+proxy variables. The parent environment and existing AWS authentication remain
+unchanged, so a dead localhost proxy cannot prevent its own security-group repair.
+
+To build from source: `npm ci`, `npm test`, then `npm run package`. The output
+filename follows the version in `package.json`.
+
+## Automatic recovery after changing Wi-Fi
+
+The one-time SSH host-trust prompt is saved in Windows `known_hosts`. It is not
+required on every start. With Proxy On and the settings below, opening VS Code
+starts monitoring, checks the existing chain, and starts SSH and the HTTP bridge
+if needed. A working chain is left running. Subsequent outages trigger bounded
+background retries, and public-IP polling detects Wi-Fi changes.
+
+This supervisor runs while VS Code is open. It is not a Windows login service.
+Keep the legacy Task Scheduler tunnel/bridge tasks disabled so there is only
+one supervisor. Proxy Off persists across restarts; use **OpenCode Proxy: Turn
+Proxy On** once if you previously turned it off.
+
+In **Preferences: Open User Settings (JSON)**, merge these settings into your
+existing object. Replace the security-group placeholder with the group attached
+to your EC2 instance. Configure a valid AWS CLI profile on the same Windows
+machine; CloudShell's credentials do not configure the local extension.
+
+```json
+{
+  "opencodeProxyHealth.supervisorMode": "direct",
+  "opencodeProxyHealth.securityGroupId": "YOUR_ATTACHED_SECURITY_GROUP_ID",
+  "opencodeProxyHealth.awsRegion": "eu-north-1",
+  "opencodeProxyHealth.enableAwsRepair": true,
+  "opencodeProxyHealth.autoRecover": true,
+  "opencodeProxyHealth.autoRecoverDryRun": false,
+  "opencodeProxyHealth.bootstrapRecoverOnStartup": true,
+  "opencodeProxyHealth.publicIpPollSec": 30
+}
+```
+
+The extension checks the current IPv4 address directly, even while the proxy is
+down. On an IP change it verifies the chain, authorizes the new `/32` if AWS SSH
+is blocked, then recovers and verifies the proxy. New rules carry the
+`opencode-proxy` description so subsequent repairs can identify them. New
+access is verified before stale managed rules are removed. Unmarked manual
+rules and old tag-only rules are retained; identify them manually before any
+cleanup. Do not label another user's rule as managed by this proxy.
+
+Network checks run one at a time, respect `autoRecover: false`, and stop doing
+work when the proxy is turned off. Failed requests cannot release another
+request's proxy bypass. Default polling remains off until roaming is enabled.
+
+Automatic IP repair requires access to the AWS API and outbound SSH on the
+configured port. A captive portal must be completed first. A network that
+blocks SSH will still require an allowed transport; opening the EC2 firewall
+does not bypass that network's restrictions. Host trust and SSH authentication
+must also be established before background recovery can succeed.
+
+## SSH reaches EC2 but the SOCKS port never opens
+
+Health probes also decode HTTP chunk framing before parsing IP echoes or model
+lists, preserve UTF-8 across network packet boundaries, and accept bodyless
+HEAD/204 responses. Malformed or truncated responses remain failures. A skipped
+or dry-run network recovery cannot leave the monitor stuck in RECONNECTING.
+
+v0.11.1 captures bounded SSH/bridge stderr and exit codes, redacts the configured
+private-key path, and stops waiting for a port as soon as its child exits.
+Diagnostics and recovery notifications show the startup error. Missing or
+unreadable key files fail before SSH is launched. SSH uses the configured
+identity with `IdentitiesOnly=yes`; host verification remains enabled.
+The startup log and diagnostic report show the installed extension version.
+
+If SSH reports **Host key verification failed**, first verify the instance's
+SSH host fingerprint in the AWS EC2 console: select the instance, then
+**Actions → Monitor and troubleshoot → Get system log**. Find the
+`BEGIN SSH HOST KEY FINGERPRINTS` section and compare the corresponding
+algorithm/fingerprint with the SSH prompt. This is the instance host key,
+not the key-pair fingerprint shown on the EC2 Key pairs page. See
+[AWS connection prerequisites](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connection-prereqs-general.html).
+
+After verifying the fingerprint, connect interactively once using your actual
+configured key, user, host and port. For the default configuration:
+
+```powershell
+$key = "$env:USERPROFILE\.ssh\opencode-proxy-key.pem"
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" -i $key -p 22 -o BatchMode=no -o StrictHostKeyChecking=ask -o IdentitiesOnly=yes ubuntu@16.192.228.28 exit
+```
+
+Accept the trust prompt only if the fingerprint matches the verified instance.
+Then run **OpenCode Proxy: Recover Proxy**. Background SSH uses `BatchMode=yes`,
+so it cannot ask you to accept a previously unknown host. If SSH reports a
+changed host key instead, investigate the change and verify the replacement
+before editing that host's known-hosts entry. Do not disable host verification
+or delete the whole known-hosts file.
+
+If port 22 is already reachable, adding a security-group ID will not resolve
+host trust or authentication errors. A passphrase-protected private key must
+be available through `ssh-agent` for background SSH to use it. A successful
+interactive login must be followed by recovery and an end-to-end proxy check;
+it does not prove SOCKS forwarding or the HTTP bridge is working yet.
+
+Pulling the repository does not update the installed VSIX. After updating,
+build/package/install as described below and reload VS Code. Confirm the
+startup log says `version 0.11.3`.
+
+## VS Code shows "Error acquiring .NET" / WebRequestError
+
+This extension has no .NET runtime dependency. That message comes from the
+.NET Install Tool used by another extension. Open **View → Output**, select
+the .NET installation/runtime channel, and copy the full failure including
+the download URL and underlying error. `WebRequestError` alone does not
+identify a firewall, proxy, TLS, or download failure.
+
+Verify the proxy is READY before configuring .NET to use it. When the local
+HTTP bridge is healthy and you want .NET downloads through it, the supported
+setting is `"dotnetAcquisitionExtension.proxyUrl": "http://127.0.0.1:8080"`
+(use your configured HTTP port). Remove that explicit setting when downloading
+directly with the proxy off. Proxy shutdown does not rewrite other extensions'
+settings or your existing terminal environment. Microsoft also documents using
+an existing compatible .NET installation through `existingDotnetPath` in its
+[C# Dev Kit troubleshooting guide](https://code.visualstudio.com/docs/csharp/cs-dev-kit-faq#_net-sdk).
 
 ## Turn the proxy off and back on
 
@@ -236,14 +377,14 @@ HTTP_PROXY_UP -> READY`, else `RECOVERY_FAILED`.
 - Roaming-IP repair: when :22 is unreachable, the current public IP is
   discovered DIRECTLY (https://api.ipify.org → checkip.amazonaws.com →
   ifconfig.me/ip, proxy bypassed — never via :8080), the SG is described
-  first, stale proxy `/32`s revoked, current `/32` authorized, re-described
-  to verify, then :22 retried. Uses your existing AWS CLI profile
+  first, current `/32` authorized and re-described to verify, then stale
+  managed `/32`s removed and :22 retried. Uses your existing AWS CLI profile
   (`awsProfile`/`awsRegion`); no credentials in source/settings/logs. Never
   opens `0.0.0.0/0`, never touches foreign rules, never adds duplicates.
 - Startup: health-check first; if unhealthy and `bootstrapRecoverOnStartup`
   (default on), run the machine once — works before OpenCode is usable.
 - Network change: lightweight direct public-IP poll every `publicIpPollSec`
-  (default 120s, min 30s — never every few ms); on change, re-check and
+  (default off; when enabled, min 30s); on change, re-check and
   recover. Handles Wi-Fi change, wake-from-sleep, DNS/AWS blips, timeouts,
   crashes, transient port absence.
 - Logs: `[PROXY CHECK] [AWS SSH CHECK] [PUBLIC IP] [SECURITY GROUP UPDATE]

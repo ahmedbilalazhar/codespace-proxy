@@ -74,7 +74,7 @@ import {
   updateHistory,
   uptimeSummary,
 } from './history';
-import { DeepInfo, deepDiagnose, emptyDeep, formatDeep } from './diagnose';
+import { DeepInfo, deepDiagnose, emptyDeep, formatDeep, type ExecAsync } from './diagnose';
 import {
   RecoverAttempt,
   RecoverConfig,
@@ -399,11 +399,17 @@ export class Monitor {
   private recoveryFailNotified = false;
   private bootstrapDone = false;
   private publicIpTimer: NodeJS.Timeout | null = null;
+  private publicIpPollRunning = false;
   private lastPublicIp: string | null = null;
   private lastPublicIpAt = 0;
   private schedulerConflictWarned = false;
   private wakeHook: vscode.Disposable | null = null;
   private cfg: ExtConfig = readExtConfig().cfg;
+  private lastRecoveryFailure: string | null = null;
+
+  private get extensionVersion(): string {
+    return this.context.extension?.packageJSON?.version ?? 'unknown';
+  }
 
   constructor(
     private context: vscode.ExtensionContext,
@@ -441,7 +447,7 @@ export class Monitor {
       }
     }
     this.emit(
-      `[${stamp()}] Monitor started (interval ${cfg.intervalSec}s, supervisor=${cfg.supervisorMode}). Auto-recovery ${cfg.autoRecover ? (cfg.autoRecoverDryRun ? 'dry run' : 'enabled') : 'off'}. Direct bootstrap ${cfg.bootstrapRecoverOnStartup ? 'on' : 'off'}.`,
+      `[${stamp()}] Monitor started (version ${this.extensionVersion}, interval ${cfg.intervalSec}s, supervisor=${cfg.supervisorMode}). Auto-recovery ${cfg.autoRecover ? (cfg.autoRecoverDryRun ? 'dry run' : 'enabled') : 'off'}. Direct bootstrap ${cfg.bootstrapRecoverOnStartup ? 'on' : 'off'}.`,
     );
     if (cfg.supervisorMode === 'direct') {
       this.emit(
@@ -525,9 +531,9 @@ export class Monitor {
     }
   }
 
-  private proxyExec = (file: string, args: string[], timeout: number): Promise<string> => {
+  private proxyExec: ExecAsync = (file, args, timeout, options) => {
     if (!this.lifecycle.enabled) return Promise.reject(new Error('Proxy is turned off'));
-    return defaultExecAsync(file, args, timeout);
+    return defaultExecAsync(file, args, timeout, options);
   };
 
   turnOff(): Promise<void> {
@@ -927,8 +933,10 @@ export class Monitor {
             downSince: this.downSince,
           })
         : 'OpenCode Proxy Health\n────────────────────────\n(no check has completed yet)',
-      `Supervisor           ${cfg.supervisorMode}${cfg.supervisorMode === 'direct' ? ' (SOLE owner: 1x ssh.exe -D 127.0.0.1:1080 + 1x hpts -p 8080; Task Scheduler tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}" must be DISABLED)' : ` (legacy tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}")`}`,
+      `Extension version    ${this.extensionVersion}`,
+      `Supervisor           ${cfg.supervisorMode}${cfg.supervisorMode === 'direct' ? ` (SOLE owner: 1x ssh.exe -D ${cfg.socksHost}:${cfg.socksPort} + 1x hpts -p ${cfg.httpPort}; Task Scheduler tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}" must be DISABLED)` : ` (legacy tasks "${cfg.sshTaskName}" / "${cfg.bridgeTaskName}")`}`,
       `Recovery state       ${this.recoveryState ?? '(none)'}${this.directRecoveryRunning ? ' (running)' : ''}`,
+      ...(this.lastRecoveryFailure ? [`Recovery failure     ${this.lastRecoveryFailure}`] : []),
       `AWS                  EC2 ${cfg.ec2Host}:${cfg.sshPort} · SG ${cfg.securityGroupId || '(not configured)'}${cfg.awsProfile ? ` · profile ${cfg.awsProfile}` : ''}${cfg.awsRegion ? ` · region ${cfg.awsRegion}` : ''}`,
       `Direct public IP     ${this.lastPublicIp ?? '(unknown — direct poll, proxy bypassed)'}${this.lastPublicIp ? ` (${Math.round((Date.now() - this.lastPublicIpAt) / 1000)}s ago)` : ''}`,
       `Requests             ${this.requestLine()} — ${this.requestDetail()}`,
@@ -1228,7 +1236,7 @@ export class Monitor {
    */
   private async maybeRecover(): Promise<void> {
     if (!this.lifecycle.enabled || !this.cfg.autoRecover) return;
-    if (this.runbookRunning || this.autoRecoveryRunning || this.manualRecoveryRunning || this.directRecoveryRunning) {
+    if (this.runbookRunning || this.autoRecoveryRunning || this.manualRecoveryRunning || this.directRecoveryRunning || this.publicIpPollRunning) {
       return;
     }
     // Direct supervisor owns recovery via the verified state machine; the
@@ -1426,6 +1434,7 @@ export class Monitor {
       this.lastDirectRecoveryAt = Date.now();
       this.recoveryState = outcome.state;
       if (outcome.ok) {
+        this.lastRecoveryFailure = null;
         this.cadence = emptyRecoveryCadence();
         this.recoveryFailNotified = false;
         this.emit(`[${stamp()}] [RECOVERY SUCCESS] Direct recovery READY in ${outcome.elapsedMs}ms — SOCKS :${rcfg.socksPort} + HTTP :${rcfg.httpPort} verified end-to-end.`);
@@ -1441,6 +1450,7 @@ export class Monitor {
         }
         void this.checkSchedulerConflict();
       } else {
+        this.lastRecoveryFailure = [...outcome.logs].reverse().find((l) => l.tag === 'RECOVERY FAILURE')?.message ?? outcome.state;
         this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
         this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery FAILED (${outcome.state}): path ${outcome.path.join(' -> ')}.`);
         this.display = 'RECOVERY_FAILED';
@@ -1450,11 +1460,12 @@ export class Monitor {
         const manual = reason === 'manual-command' || reason === 'dashboard' || reason === 'manual-runbook-redirect';
         if (manual || !this.recoveryFailNotified) {
           this.recoveryFailNotified = true;
-          this.notifyFail(`Proxy recovery failed (${outcome.state}). Will keep retrying in the background — see output log.`);
+          this.notifyFail(`Proxy recovery failed: ${this.lastRecoveryFailure.slice(0, 350)} See output log for details.`);
         }
       }
     } catch (e) {
       if (!this.lifecycle.enabled) return;
+      this.lastRecoveryFailure = (e as Error).message;
       this.cadence = { ...this.cadence, failedAttempts: this.cadence.failedAttempts + 1, lastAttemptMs: Date.now() };
       this.emit(`[${stamp()}] [RECOVERY FAILURE] Direct recovery threw: ${(e as Error).message}`);
       this.display = 'RECOVERY_FAILED';
@@ -1495,7 +1506,14 @@ export class Monitor {
    * On a detected change: mark RECONNECTING (not failed), verify, recover.
    */
   private async pollPublicIpOnce(force = false): Promise<void> {
-    await this.lifecycle.run(() => this.pollPublicIpOnceInner(force));
+    if (this.publicIpPollRunning || !this.lifecycle.enabled) return;
+    if (!force && (!this.cfg.autoRecover || this.cfg.supervisorMode !== 'direct' || this.cfg.publicIpPollSec <= 0)) return;
+    this.publicIpPollRunning = true;
+    try { await this.lifecycle.run(() => this.pollPublicIpOnceInner(force)); }
+    catch (e) {
+      if (this.lifecycle.enabled) this.emit(`[${stamp()}] [NETWORK CHECK] Verification failed: ${(e as Error).message}`);
+    }
+    finally { this.publicIpPollRunning = false; }
   }
 
   private async pollPublicIpOnceInner(force = false): Promise<void> {
@@ -1511,27 +1529,33 @@ export class Monitor {
     } catch {
       return;
     }
-    if (!this.lifecycle.enabled) return;
+    if (!this.lifecycle.enabled || (!force && !this.cfg.autoRecover)) return;
+    if (this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) return;
     const prev = this.lastPublicIp;
-    if (!prev && !force) {
-      this.lastPublicIp = found.ip;
-      this.lastPublicIpAt = Date.now();
-      return;
-    }
-    if (force || found.ip !== prev) {
+    this.lastPublicIp = found.ip;
+    this.lastPublicIpAt = Date.now();
+    if (force || (prev !== null && found.ip !== prev) || (!prev && this.baseState !== 'HEALTHY')) {
       this.emit(`[${stamp()}] [PUBLIC IP] ${force ? 'Manual network verification' : 'Network change detected'}: ${prev ?? 'unknown'} -> ${found.ip} (via ${found.service}, direct, proxy bypassed). Marking RECONNECTING (not failed) and verifying.`);
-      this.lastPublicIp = found.ip;
-      this.lastPublicIpAt = Date.now();
       // Attributed change: RECONNECTING owns the outcome — never PROXY_FAILED
       // before the G-sequence (check :22, SG repair, rebuild, verify) settles.
       this.reconnecting = true;
       this.display = 'RECONNECTING';
       this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
-      await this.check(false);
-      if (this.baseState !== 'HEALTHY' && this.cfg.supervisorMode === 'direct') {
-        await this.runDirectRecovery('network-change');
-      } else {
-        this.reconnecting = false;
+      try {
+        await this.check(false);
+        if (this.lifecycle.enabled && (force || this.cfg.autoRecover) && this.baseState !== 'HEALTHY' && this.cfg.supervisorMode === 'direct') {
+          await this.runDirectRecovery('network-change');
+        }
+      } finally {
+        // A dry run, skipped recovery, or thrown check must release the
+        // attribution flag or future failures remain RECONNECTING forever.
+        if (!this.directRecoveryRunning) {
+          this.reconnecting = false;
+          if (this.lifecycle.enabled && this.display === 'RECONNECTING') {
+            this.display = this.policy.verdict === 'PROXY_DOWN' ? 'PROXY_DOWN' : 'DEGRADED';
+            this.applyView(presentDisplay(this.display, { activeCount: this.req.activeCount }), this.display);
+          }
+        }
       }
     }
   }
@@ -1547,7 +1571,7 @@ export class Monitor {
       void vscode.window.showWarningMessage('Manual network check applies to supervisor=direct only.');
       return;
     }
-    if (this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) {
+    if (this.publicIpPollRunning || this.directRecoveryRunning || this.runbookRunning || isRecoveryRunning()) {
       void vscode.window.showInformationMessage('A recovery is already running — let it finish first.');
       return;
     }

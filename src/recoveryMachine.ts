@@ -52,6 +52,8 @@ import {
   spawnHpts,
   type ProxyProcConfig,
   type SpawnFn,
+  type ProxySpawnResult,
+  startupFailure,
 } from './procOwn';
 import { waitForPort } from './runbook';
 import type { ExecAsync } from './diagnose';
@@ -160,8 +162,8 @@ export interface RecoveryDeps {
   listSsh?: (cfg: RecoveryMachineConfig) => Promise<{ kept: number | null; killed: number[]; detail: string }>;
   listHpts?: (cfg: RecoveryMachineConfig) => Promise<{ kept: number | null; killed: number[]; detail: string }>;
   portOwner?: (port: number) => Promise<number | null>;
-  spawnSshFn?: (cfg: RecoveryMachineConfig) => { ok: boolean; pid: number | null; detail: string };
-  spawnHptsFn?: (cfg: RecoveryMachineConfig) => { ok: boolean; pid: number | null; detail: string };
+  spawnSshFn?: (cfg: RecoveryMachineConfig) => ProxySpawnResult;
+  spawnHptsFn?: (cfg: RecoveryMachineConfig) => ProxySpawnResult;
   socksE2E?: (host: string, port: number, timeoutMs: number) => Promise<{ ip: string; service: string; elapsedMs: number }>;
   /** Distinguishes "tunnel dead" from "echo service dead" for the final verdict. */
   socksProbe?: (host: string, port: number, timeoutMs: number) => Promise<SocksProbeResult>;
@@ -412,11 +414,13 @@ async function runRecoveryInner(
         5000,
         sleep,
         now,
+        () => startupFailure('SSH', spawned),
       );
       emit('SOCKS CHECK', waited.up ? `TCP ${cfg.socksHost}:${cfg.socksPort} opened after ${waited.waitedMs}ms (${waited.probes} probes)` : `TCP ${cfg.socksHost}:${cfg.socksPort} never opened in ${Math.round(waited.waitedMs / 1000)}s`);
       if (!waited.up) {
-        enter('RECOVERY_FAILED', `ssh started (pid ${spawned.pid}) but :${cfg.socksPort} never opened`);
-        emit('RECOVERY FAILURE', `ssh started but SOCKS port never opened — never assuming ssh.exe means healthy`);
+        const detail = waited.failure ?? `ssh started (pid ${spawned.pid}) but :${cfg.socksPort} never opened`;
+        enter('RECOVERY_FAILED', detail);
+        emit('RECOVERY FAILURE', detail);
         return fail();
       }
       enter('SOCKS_UP', `TCP ${cfg.socksHost}:${cfg.socksPort} listening`);
@@ -525,12 +529,13 @@ async function runRecoveryInner(
             5000,
             sleep,
             now,
+            () => startupFailure('SSH', spawned2),
           );
           if (waited2.up) {
             enter('SOCKS_UP', `fresh tunnel listening, re-verifying end-to-end`);
             socksOk = await runSocksE2E();
           } else {
-            lastSocksErr = `fresh ssh started (pid ${spawned2.pid}) but :${cfg.socksPort} never reopened`;
+            lastSocksErr = waited2.failure ?? `fresh ssh started (pid ${spawned2.pid}) but :${cfg.socksPort} never reopened`;
           }
         } else {
           lastSocksErr = spawned2.detail;
@@ -611,11 +616,13 @@ async function runRecoveryInner(
         5000,
         sleep,
         now,
+        () => startupFailure('HTTP bridge', spawnedH),
       );
       emit('HTTP PROXY CHECK', waited.up ? `TCP 127.0.0.1:${cfg.httpPort} opened after ${waited.waitedMs}ms` : `TCP 127.0.0.1:${cfg.httpPort} never opened`);
       if (!waited.up) {
-        enter('RECOVERY_FAILED', `hpts started (pid ${spawnedH.pid}) but :${cfg.httpPort} never opened`);
-        emit('RECOVERY FAILURE', `hpts started but HTTP port never opened`);
+        const detail = waited.failure ?? `hpts started (pid ${spawnedH.pid}) but :${cfg.httpPort} never opened`;
+        enter('RECOVERY_FAILED', detail);
+        emit('RECOVERY FAILURE', detail);
         return fail();
       }
       enter('HTTP_PROXY_UP', `TCP 127.0.0.1:${cfg.httpPort} listening`);
@@ -661,7 +668,8 @@ async function runRecoveryInner(
         assertActive();
         const restarted = (deps.spawnHptsFn ?? ((c) => spawnHpts(c, spawnFn)))(cfg);
         if (!restarted.ok) { enter('RECOVERY_FAILED', restarted.detail); return fail(); }
-        const waited = await waitForPort(safeCheck, '127.0.0.1', cfg.httpPort, cfg.httpWaitMs, 750, 5000, sleep, now);
+        const waited = await waitForPort(safeCheck, '127.0.0.1', cfg.httpPort, cfg.httpWaitMs, 750, 5000, sleep, now, () => startupFailure('HTTP bridge', restarted));
+        if (waited.failure) { enter('RECOVERY_FAILED', waited.failure); emit('RECOVERY FAILURE', waited.failure); return fail(); }
         if (waited.up) transport = await probeHttp();
       }
     }

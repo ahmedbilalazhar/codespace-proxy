@@ -24,9 +24,11 @@ loader._load = originalLoad;
 const health = require('../src/health');
 const machine = require('../src/recoveryMachine');
 const tasks = require('../src/recover');
+const awsNet = require('../src/awsNet');
 
 function createMonitor(saved = new Map<string, unknown>()) {
   const context = {
+    extension: { packageJSON: { version: '0.11.2' } },
     subscriptions: [], globalState: {
       get: (key: string, fallback: unknown) => saved.has(key) ? saved.get(key) : fallback,
       update: async (key: string, value: unknown) => { saved.set(key, value); },
@@ -46,6 +48,146 @@ function healthResult(ok: boolean) {
     zenMs: null, transportStatus: ok ? 204 : null,
   } };
 }
+
+it('diagnostics identify the installed version and expand actual task names and ports', () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.sshTaskName = 'Custom SSH';
+  monitor.cfg.bridgeTaskName = 'Custom Bridge';
+  monitor.cfg.socksPort = 11080;
+  monitor.cfg.httpPort = 18080;
+  try {
+    const report = monitor.buildFullReport();
+    assert.match(report, /Extension version\s+0\.11\.2/);
+    assert.match(report, /127\.0\.0\.1:11080/);
+    assert.match(report, /hpts -p 18080/);
+    assert.match(report, /"Custom SSH" \/ "Custom Bridge"/);
+    assert.ok(!report.includes('${cfg.'));
+  } finally { monitor.dispose(); }
+});
+
+it('the extension forwards the direct AWS subprocess environment', async () => {
+  const { monitor } = createMonitor();
+  const original = tasks.defaultExecAsync;
+  const options = { env: { NO_PROXY: '*' } };
+  tasks.defaultExecAsync = async (_file: string, _args: string[], _timeout: number, received: unknown) => {
+    assert.equal(received, options);
+    return 'direct AWS response';
+  };
+  try { assert.equal(await monitor.proxyExec('aws', [], 1000, options), 'direct AWS response'); }
+  finally { tasks.defaultExecAsync = original; monitor.dispose(); }
+});
+
+it('manual recovery preserves the actual startup error in diagnostics and its notification', async () => {
+  const { monitor } = createMonitor();
+  const detail = 'SSH exited with code 255: Host key verification failed.';
+  let notification = '';
+  monitor.notifyFail = (message: string) => { notification = message; };
+  machine.recoverProxy = async () => ({ ...readyOutcome, ok: false, state: 'RECOVERY_FAILED', logs: [{ tag: 'RECOVERY FAILURE', message: detail, at: 'now' }] });
+  try {
+    await monitor.runDirectRecovery('manual-command');
+    assert.match(monitor.buildFullReport(), /Recovery failure\s+SSH exited with code 255: Host key verification failed/);
+    assert.ok(notification.includes(detail));
+  } finally { monitor.dispose(); }
+});
+
+it('an automatic Wi-Fi IP change owns exactly one recovery despite a failed health check', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.lastPublicIp = '1.1.1.1';
+  monitor.baseState = 'SSH_DOWN';
+  let recoveries = 0;
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  monitor.runDirectRecovery = async (reason: string) => { assert.equal(reason, 'network-change'); recoveries++; };
+  monitor.check = async () => { monitor.display = 'PROXY_DOWN'; await monitor.maybeRecover(); };
+  try {
+    await monitor.pollPublicIpOnce();
+    assert.equal(recoveries, 1);
+    assert.equal(monitor.lastPublicIp, '9.9.9.9');
+    assert.equal(monitor.publicIpPollRunning, false);
+  } finally { monitor.dispose(); }
+});
+
+it('the first automatic IP discovery checks and repairs an unhealthy proxy', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let recoveries = 0;
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  monitor.check = async () => {};
+  monitor.runDirectRecovery = async () => { recoveries++; };
+  try { await monitor.pollPublicIpOnce(); assert.equal(recoveries, 1); }
+  finally { monitor.dispose(); }
+});
+
+it('overlapping network polls discover and repair only once', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let release!: () => void;
+  let fetched = 0;
+  let repaired = 0;
+  awsNet.fetchDirectPublicIp = () => { fetched++; return new Promise((r) => { release = () => r({ ip: '9.9.9.9', service: 'test' }); }); };
+  monitor.check = async () => {};
+  monitor.runDirectRecovery = async () => { repaired++; };
+  try {
+    const first = monitor.pollPublicIpOnce();
+    await new Promise((r) => setImmediate(r));
+    await monitor.pollPublicIpOnce();
+    release();
+    await first;
+    assert.equal(fetched, 1);
+    assert.equal(repaired, 1);
+  } finally { monitor.dispose(); }
+});
+
+it('automatic network polling respects autoRecover=false and off during discovery', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.cfg.autoRecover = false;
+  awsNet.fetchDirectPublicIp = async () => assert.fail('lookup despite opt-out');
+  monitor.runDirectRecovery = async () => assert.fail('repair despite opt-out');
+  try {
+    await monitor.pollPublicIpOnce();
+    monitor.cfg.autoRecover = true;
+    awsNet.fetchDirectPublicIp = async () => { monitor.lifecycle.enabled = false; return { ip: '9.9.9.9', service: 'test' }; };
+    await monitor.pollPublicIpOnce();
+    assert.equal(monitor.lastPublicIp, null);
+    assert.equal(monitor.publicIpPollRunning, false);
+  } finally { monitor.dispose(); }
+});
+
+it('a dry-run network recovery releases RECONNECTING without launching processes', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.cfg.autoRecoverDryRun = true;
+  monitor.baseState = 'SSH_DOWN';
+  monitor.check = async () => {};
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  machine.recoverProxy = async () => assert.fail('dry run launched recovery');
+  try {
+    await monitor.pollPublicIpOnce();
+    assert.equal(monitor.reconnecting, false);
+    assert.equal(monitor.publicIpPollRunning, false);
+    assert.equal(monitor.display, 'DEGRADED');
+  } finally { monitor.dispose(); }
+});
+
+it('a thrown network health check releases attribution and permits later polling', async () => {
+  const { monitor } = createMonitor();
+  monitor.cfg.publicIpPollSec = 30;
+  monitor.baseState = 'SSH_DOWN';
+  let checks = 0;
+  monitor.check = async () => { checks++; throw new Error('probe failed'); };
+  awsNet.fetchDirectPublicIp = async () => ({ ip: '9.9.9.9', service: 'test' });
+  try {
+    await monitor.pollPublicIpOnce(true);
+    assert.equal(monitor.reconnecting, false);
+    assert.equal(monitor.display, 'DEGRADED');
+    await monitor.pollPublicIpOnce(true);
+    assert.equal(checks, 2);
+    assert.equal(monitor.publicIpPollRunning, false);
+  } finally { monitor.dispose(); }
+});
 
 it('successful auto-recovery completes its parent health check instead of awaiting itself', { timeout: 1500 }, async () => {
   const { monitor } = createMonitor();
@@ -96,6 +238,39 @@ it('persisted off mode starts neither timers, probes nor bootstrap recovery', as
     assert.equal(monitor.timer, null);
     assert.equal(monitor.publicIpTimer, null);
     assert.equal(monitor.display, 'OFF');
+  } finally { monitor.dispose(); }
+});
+
+it('enabled startup bootstraps an unhealthy proxy once before the strike threshold', async () => {
+  const { monitor } = createMonitor();
+  let recoveries = 0;
+  let finish!: () => void;
+  const recovered = new Promise<void>((r) => { finish = r; });
+  health.runHealthCheckGuarded = async () => healthResult(false);
+  monitor.runDirectRecovery = async (reason: string) => {
+    assert.equal(reason, 'startup');
+    recoveries++;
+    finish();
+  };
+  try {
+    monitor.start();
+    await recovered;
+    assert.ok(monitor.timer);
+    await monitor.maybeBootstrap();
+    assert.equal(recoveries, 1);
+  } finally { monitor.dispose(); }
+});
+
+it('healthy startup monitors without restarting the working proxy', async () => {
+  const { monitor } = createMonitor();
+  health.runHealthCheckGuarded = async () => healthResult(true);
+  monitor.runDirectRecovery = async () => assert.fail('healthy proxy restarted at startup');
+  try {
+    monitor.start();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(monitor.bootstrapDone, true);
+    assert.equal(monitor.baseState, 'HEALTHY');
+    assert.ok(monitor.timer);
   } finally { monitor.dispose(); }
 });
 
