@@ -259,11 +259,21 @@ function firstLine(s: string): string {
  * (ENOENT) — route through cmd.exe. Real .exe installs also work via cmd.
  * All args are ours (group ids, CIDRs, flags); no shell metacharacters.
  */
-function runAws(exec: ExecAsync, args: string[], timeoutMs: number): Promise<string> {
-  if (process.platform === 'win32') {
-    return exec('cmd.exe', ['/d', '/c', 'aws', ...args], timeoutMs);
+export function awsCliInvocation(args: string[], platform: string = process.platform): { file: string; args: string[] } {
+  if (platform === 'win32') {
+    // Profile/region/group settings are user input. cmd.exe expands %VAR%
+    // and interprets metacharacters even though execFile itself uses no shell.
+    if (args.some((arg) => /["%!&|<>^\r\n]/.test(arg))) {
+      throw new Error('AWS CLI settings contain unsupported Windows command expansion characters');
+    }
+    return { file: 'cmd.exe', args: ['/d', '/v:off', '/c', 'aws', ...args] };
   }
-  return exec('aws', args, timeoutMs);
+  return { file: 'aws', args };
+}
+
+function runAws(exec: ExecAsync, args: string[], timeoutMs: number): Promise<string> {
+  const invocation = awsCliInvocation(args);
+  return exec(invocation.file, invocation.args, timeoutMs);
 }
 
 /** Describe TCP-22 ingress rules on the SG. Never throws — failures are data. */

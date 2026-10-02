@@ -23,18 +23,17 @@ function decodeChunked(body: Buffer): Buffer {
       if (trailers.some((line) => !/^[!#$%&'*+.^_`|~0-9a-z-]+:/i.test(line))) throw new Error('invalid HTTP chunk trailer');
       return Buffer.concat(chunks, total);
     }
-    if (offset + size + 2 > body.length || body.subarray(offset + size, offset + size + 2).toString('ascii') !== '\r\n') {
-      throw new Error('incomplete HTTP chunk data');
-    }
+    if (offset + size + 2 > body.length) throw new Error('incomplete HTTP chunk data');
+    if (body.subarray(offset + size, offset + size + 2).toString('ascii') !== '\r\n') throw new Error('invalid HTTP chunk terminator');
     chunks.push(body.subarray(offset, offset + size));
     total += size;
     offset += size + 2;
   }
 }
 
-/** Decode framing before UTF-8 so TCP splits cannot corrupt text/chunk sizes. */
-export function parseHttpResponse(raw: string | Buffer, options: { method?: string; headersOnly?: boolean } = {}): ParsedHttpResponse {
-  const bytes = typeof raw === 'string' ? Buffer.from(raw, 'utf8') : raw;
+interface ResponseOptions { method?: string; headersOnly?: boolean; }
+
+function finalHead(bytes: Buffer): { statusCode: number; headers: Map<string, string[]>; bodyOffset: number } {
   let offset = 0;
   for (;;) {
     const sep = bytes.indexOf('\r\n\r\n', offset);
@@ -46,8 +45,6 @@ export function parseHttpResponse(raw: string | Buffer, options: { method?: stri
     const statusCode = match ? Number(match[1]) : 0;
     if (statusCode < 100 || statusCode > 599) throw new Error(`unparseable HTTP status line: ${status.slice(0, 80)}`);
     if (statusCode === 101) throw new Error('unexpected HTTP protocol upgrade');
-    if (statusCode < 200) { offset = sep + 4; continue; }
-
     const headers = new Map<string, string[]>();
     for (const line of lines) {
       const colon = line.indexOf(':');
@@ -55,27 +52,53 @@ export function parseHttpResponse(raw: string | Buffer, options: { method?: stri
       const name = line.slice(0, colon).toLowerCase();
       headers.set(name, [...(headers.get(name) ?? []), line.slice(colon + 1).trim()]);
     }
-    const method = options.method?.toUpperCase();
-    // CONNECT negotiation inspects status before the error body arrives.
-    if (options.headersOnly || method === 'HEAD' || statusCode === 204 || statusCode === 304 || (method === 'CONNECT' && statusCode >= 200 && statusCode < 300)) {
-      return { statusCode, body: '' };
-    }
-    let body = bytes.subarray(sep + 4);
-    if (body.length > MAX_BODY_BYTES) throw new Error('HTTP response exceeded size limit');
-    const transfer = headers.get('transfer-encoding');
-    const lengths = headers.get('content-length');
-    if (transfer && lengths) throw new Error('ambiguous HTTP response framing');
-    if (transfer) {
-      const codings = transfer.join(',').split(',').map((s) => s.trim().toLowerCase());
-      if (codings.length !== 1 || codings[0] !== 'chunked') throw new Error('unsupported HTTP transfer encoding');
-      body = decodeChunked(body);
-    } else if (lengths) {
-      const values = lengths.flatMap((s) => s.split(',').map((v) => v.trim()));
-      if (values.some((v) => !/^\d+$/.test(v)) || !values.every((v) => Number(v) === Number(values[0]))) throw new Error('invalid HTTP content length');
-      const length = Number(values[0]);
-      if (!Number.isSafeInteger(length) || length > MAX_BODY_BYTES) throw new Error('HTTP response exceeded size limit');
-      if (body.length !== length) throw new Error('incomplete or excessive HTTP response body');
-    }
-    return { statusCode, body: body.toString('utf8') };
+    if (statusCode < 200) { offset = sep + 4; continue; }
+    return { statusCode, headers, bodyOffset: sep + 4 };
+  }
+}
+
+function bodyless(statusCode: number, options: ResponseOptions): boolean {
+  const method = options.method?.toUpperCase();
+  return !!options.headersOnly || method === 'HEAD' || statusCode === 204 || statusCode === 304 ||
+    (method === 'CONNECT' && statusCode >= 200 && statusCode < 300);
+}
+
+/** Decode framing before UTF-8 so TCP splits cannot corrupt text/chunk sizes. */
+export function parseHttpResponse(raw: string | Buffer, options: ResponseOptions = {}): ParsedHttpResponse {
+  const bytes = typeof raw === 'string' ? Buffer.from(raw, 'utf8') : raw;
+  const { statusCode, headers, bodyOffset } = finalHead(bytes);
+  // CONNECT negotiation inspects status before the error body arrives.
+  if (bodyless(statusCode, options)) return { statusCode, body: '' };
+  let body = bytes.subarray(bodyOffset);
+  if (body.length > MAX_BODY_BYTES) throw new Error('HTTP response exceeded size limit');
+  const transfer = headers.get('transfer-encoding');
+  const lengths = headers.get('content-length');
+  if (transfer && lengths) throw new Error('ambiguous HTTP response framing');
+  if (transfer) {
+    const codings = transfer.join(',').split(',').map((s) => s.trim().toLowerCase());
+    if (codings.length !== 1 || codings[0] !== 'chunked') throw new Error('unsupported HTTP transfer encoding');
+    body = decodeChunked(body);
+  } else if (lengths) {
+    const values = lengths.flatMap((s) => s.split(',').map((v) => v.trim()));
+    if (values.some((v) => !/^\d+$/.test(v)) || !values.every((v) => Number(v) === Number(values[0]))) throw new Error('invalid HTTP content length');
+    const length = Number(values[0]);
+    if (!Number.isSafeInteger(length) || length > MAX_BODY_BYTES) throw new Error('HTTP response exceeded size limit');
+    if (body.length < length) throw new Error('incomplete HTTP response body');
+    if (body.length > length) throw new Error('excessive HTTP response body');
+  }
+  return { statusCode, body: body.toString('utf8') };
+}
+
+/** A framed response can finish before EOF; close-delimited bodies still need EOF.
+ * Partial headers/chunks are pending, while invalid framing remains an error.
+ */
+export function tryParseFramedHttpResponse(raw: Buffer, options: ResponseOptions = {}): ParsedHttpResponse | null {
+  try {
+    const { statusCode, headers } = finalHead(raw);
+    if (!bodyless(statusCode, options) && !headers.has('transfer-encoding') && !headers.has('content-length')) return null;
+    return parseHttpResponse(raw, options);
+  } catch (e) {
+    if ((e as Error).message.startsWith('incomplete HTTP')) return null;
+    throw e;
   }
 }

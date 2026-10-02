@@ -1,4 +1,23 @@
-# OpenCode Proxy Health (v0.11.1)
+# OpenCode Proxy Health (v0.11.2)
+
+## Install v0.11.2
+
+Download [opencode-proxy-health-0.11.2.vsix](releases/opencode-proxy-health-0.11.2.vsix)
+using GitHub's **Download raw file** button. In VS Code, run
+**Extensions: Install from VSIX**, select that file, and then run
+**Developer: Reload Window**. Confirm the OpenCode Proxy output log reports
+`version 0.11.2`. This updates the extension without merging unrelated Git
+histories or requiring a local build.
+
+This version includes SSH startup diagnostics, safe roaming security-group
+repair, and persistent Proxy Off controls. HTTP, HTTPS, and SOCKS probes now
+finish complete framed responses without waiting for the server to close its
+connection, preventing false timeouts on persistent connections. Partial or
+malformed responses remain failures. Windows AWS CLI arguments reject command
+expansion characters instead of letting settings be interpreted by cmd.exe.
+
+To build from source: `npm ci`, `npm test`, then `npm run package`. The output
+filename follows the version in `package.json`.
 
 ## Automatic recovery after changing Wi-Fi
 
@@ -83,7 +102,7 @@ it does not prove SOCKS forwarding or the HTTP bridge is working yet.
 
 Pulling the repository does not update the installed VSIX. After updating,
 build/package/install as described below and reload VS Code. Confirm the
-startup log says `version 0.11.1`.
+startup log says `version 0.11.2`.
 
 ## VS Code shows "Error acquiring .NET" / WebRequestError
 

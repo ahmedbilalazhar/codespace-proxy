@@ -28,7 +28,7 @@ import * as tls from 'tls';
 import { execFile } from 'child_process';
 import type { DisplayState } from './status';
 import { EXPECTED_PROXY_EGRESS_IP } from './netModel';
-import { parseHttpResponse, type ParsedHttpResponse } from './httpResponse';
+import { parseHttpResponse, tryParseFramedHttpResponse, type ParsedHttpResponse } from './httpResponse';
 export { parseHttpResponse } from './httpResponse';
 
 export interface HealthConfig {
@@ -264,10 +264,19 @@ export function fetchViaHttpProxy(
       );
     });
     socket.on('data', (chunk: Buffer) => {
+      if (settled) return;
       raw = Buffer.concat([raw, chunk]);
       if (raw.length > MAX_BODY_BYTES) {
         finish(new Error('proxy response exceeded size limit'));
+        return;
       }
+      try {
+        const response = tryParseFramedHttpResponse(raw);
+        if (response) {
+          if (response.statusCode !== 200) finish(new Error(`proxy returned HTTP ${response.statusCode} for ${targetUrl}`));
+          else finish(null, response.body.trim());
+        }
+      } catch (e) { finish(e as Error); }
     });
     socket.once('timeout', () => finish(new Error(`timed out after ${timeoutMs}ms fetching ${targetUrl} via proxy`)));
     socket.once('error', (e) => finish(e as Error));
@@ -412,10 +421,16 @@ export function fetchHttpsViaProxy(
       }
       tlsSocket.setTimeout(timeoutMs);
       tlsSocket.on('data', (d: Buffer) => {
+        if (settled) return;
         tlsData = Buffer.concat([tlsData, d]);
         if (tlsData.length > MAX_BODY_BYTES) {
           fail('Zen response exceeded size limit');
+          return;
         }
+        try {
+          const response = tryParseFramedHttpResponse(tlsData, { method });
+          if (response) finish(null, response);
+        } catch (e) { finish(e as Error); }
       });
       tlsSocket.once('timeout', () => fail(`timed out after ${timeoutMs}ms waiting for Zen response`));
       tlsSocket.once('error', (e) => finish(e as Error));

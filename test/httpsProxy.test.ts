@@ -7,7 +7,7 @@ import { fetchHttpsViaProxy } from '../src/health';
 // Use a real CONNECT bridge and an injected TLS stream to test HTTP framing
 // without adding a certificate library or changing production TLS verification.
 async function throughBridge(method: string, reply: Buffer, failTls = false,
-  connectReply: string[] = ['HTTP/1.1 200 Connection established\r\nContent-Length: 0\r\n\r\n']) {
+  connectReply: string[] = ['HTTP/1.1 200 Connection established\r\nContent-Length: 0\r\n\r\n'], closeResponse = true) {
   const sockets = new Set<net.Socket>();
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -31,7 +31,7 @@ async function throughBridge(method: string, reply: Buffer, failTls = false,
         assert.ok(request.includes('Accept-Encoding: identity'));
         setImmediate(() => {
           for (let i = 0; i < reply.length; i++) stream.emit('data', reply.subarray(i, i + 1));
-          stream.emit('close');
+          if (closeResponse) stream.emit('close');
         });
       },
     });
@@ -59,6 +59,23 @@ it('HTTPS probes decode chunked UTF-8 model lists after CONNECT', async () => {
   ]);
   const response = await throughBridge('GET', reply);
   assert.deepEqual(JSON.parse(response.body), { data: [{ id: 'model-test', name: '€' }] });
+});
+
+it('HTTPS HEAD and framed GET finish even when the TLS stream stays open', async () => {
+  const responses = [
+    { method: 'HEAD', reply: 'HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n', body: '' },
+    { method: 'GET', reply: 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok', body: 'ok' },
+    { method: 'GET', reply: 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n', body: 'ok' },
+  ];
+  for (const response of responses) {
+    assert.deepEqual(await throughBridge(response.method, Buffer.from(response.reply), false, undefined, false),
+      { statusCode: 200, body: response.body });
+  }
+});
+
+it('HTTPS truncated framed responses cannot become successful on close', async () => {
+  await assert.rejects(() => throughBridge('GET', Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok')),
+    /incomplete HTTP response body/);
 });
 
 it('HTTPS HEAD probes succeed without the advertised GET body', async () => {

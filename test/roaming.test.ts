@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { ensureSshAccess, DEFAULT_AWSNET_CONFIG, fetchDirectUrl, fetchDirectPublicIp } from '../src/awsNet';
+import { ensureSshAccess, DEFAULT_AWSNET_CONFIG, fetchDirectUrl, fetchDirectPublicIp, awsCliInvocation } from '../src/awsNet';
 
 const cfg = { ...DEFAULT_AWSNET_CONFIG, securityGroupId: 'sg-test' };
 const perms = (ranges: Array<{ CidrIp: string; Description?: string }>, port = 22) => JSON.stringify([
@@ -9,6 +9,15 @@ const perms = (ranges: Array<{ CidrIp: string; Description?: string }>, port = 2
 ]);
 const old = { CidrIp: '1.1.1.1/32', Description: 'opencode-proxy' };
 const current = { CidrIp: '9.9.9.9/32', Description: 'opencode-proxy' };
+
+it('Windows AWS invocation rejects shell expansion while preserving ordinary profiles', () => {
+  const args = ['ec2', 'describe-security-groups', '--profile', 'home profile'];
+  assert.deepEqual(awsCliInvocation(args, 'win32'), { file: 'cmd.exe', args: ['/d', '/v:off', '/c', 'aws', ...args] });
+  for (const bad of ['name&other', '%USERPROFILE%', 'name|other', 'name!other', 'name"other', 'name\nother']) {
+    assert.throws(() => awsCliInvocation(['--profile', bad], 'win32'), /unsupported Windows/);
+  }
+  assert.deepEqual(awsCliInvocation(args, 'linux'), { file: 'aws', args });
+});
 
 it('roaming discovery skips IPv6 evidence and selects the usable IPv4 address', async () => {
   const result = await fetchDirectPublicIp(async (url) => url.endsWith('one') ? '2001:4860:4860::8888' : '9.9.9.9',

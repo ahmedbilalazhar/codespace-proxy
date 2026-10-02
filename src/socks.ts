@@ -21,7 +21,7 @@
 
 import * as net from 'net';
 import { isPlausibleIp } from './health';
-import { parseHttpResponse } from './httpResponse';
+import { parseHttpResponse, tryParseFramedHttpResponse } from './httpResponse';
 
 export interface SocksE2EResult {
   /** Egress IP observed through the SOCKS tunnel. */
@@ -221,42 +221,33 @@ export async function fetchViaSocks5(
       `User-Agent: opencode-proxy-health\r\nAccept-Encoding: identity\r\n\r\n`;
     await writeAll(socket, Buffer.from(req, 'utf8'));
 
-    // 4. Read until close/timeout, then split headers/body.
+    // 4. Complete framed responses immediately; otherwise wait for EOF.
     const raw: Buffer = await new Promise((resolve, reject) => {
       let acc: Buffer = Buffer.alloc(0);
-      const timer = setTimeout(() => {
-        reject(new Error(`timed out after ${remaining()}ms waiting for HTTP response through SOCKS5`));
-      }, remaining());
+      let settled = false;
+      const done = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else if (acc.length === 0) reject(new Error('empty response through SOCKS5 tunnel'));
+        else resolve(acc);
+      };
+      const timer = setTimeout(() => done(new Error(`timed out waiting for HTTP response through SOCKS5`)), remaining());
       socket.on('data', (c: Buffer) => {
+        if (settled) return;
         acc = Buffer.concat([acc, c]);
         if (acc.length > 4 * 1024 * 1024) {
-          clearTimeout(timer);
-          reject(new Error('response through SOCKS5 exceeded size limit'));
+          done(new Error('response through SOCKS5 exceeded size limit'));
+          return;
         }
+        try { if (tryParseFramedHttpResponse(acc)) done(); }
+        catch (e) { done(e as Error); }
       });
-      socket.once('error', (e) => {
-        clearTimeout(timer);
-        reject(e as Error);
-      });
-      socket.once('close', () => {
-        clearTimeout(timer);
-        if (acc.length === 0) {
-          reject(new Error('empty response through SOCKS5 tunnel'));
-        } else {
-          resolve(acc);
-        }
-      });
-      // Half-close from the server may arrive as 'end' without 'close' yet.
+      socket.once('error', (e) => done(e as Error));
+      socket.once('close', () => done());
+      socket.once('end', () => done());
       socket.resume();
-      socket.once('end', () => {
-        // Give 'close' a tick to fire; if data already complete, resolve now.
-        setTimeout(() => {
-          if (acc.length > 0) {
-            clearTimeout(timer);
-            resolve(acc);
-          }
-        }, 50);
-      });
     });
     const parsed = parseHttpResponse(raw);
     if (parsed.statusCode !== 200) throw new Error(`echo service answered HTTP ${parsed.statusCode} through SOCKS5`);

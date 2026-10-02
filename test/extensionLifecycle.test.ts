@@ -28,7 +28,7 @@ const awsNet = require('../src/awsNet');
 
 function createMonitor(saved = new Map<string, unknown>()) {
   const context = {
-    extension: { packageJSON: { version: '0.11.1' } },
+    extension: { packageJSON: { version: '0.11.2' } },
     subscriptions: [], globalState: {
       get: (key: string, fallback: unknown) => saved.has(key) ? saved.get(key) : fallback,
       update: async (key: string, value: unknown) => { saved.set(key, value); },
@@ -57,7 +57,7 @@ it('diagnostics identify the installed version and expand actual task names and 
   monitor.cfg.httpPort = 18080;
   try {
     const report = monitor.buildFullReport();
-    assert.match(report, /Extension version\s+0\.11\.1/);
+    assert.match(report, /Extension version\s+0\.11\.2/);
     assert.match(report, /127\.0\.0\.1:11080/);
     assert.match(report, /hpts -p 18080/);
     assert.match(report, /"Custom SSH" \/ "Custom Bridge"/);

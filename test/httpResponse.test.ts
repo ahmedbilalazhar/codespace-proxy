@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import * as net from 'node:net';
-import { parseHttpResponse } from '../src/httpResponse';
+import { parseHttpResponse, tryParseFramedHttpResponse } from '../src/httpResponse';
 import { fetchViaHttpProxy, modelIdPresentInZenBody } from '../src/health';
 
 it('chunked model lists decode extensions and trailers before JSON parsing', () => {
@@ -53,7 +53,8 @@ it('HTTP bridge probes decode chunked echoes across real TCP packets', async () 
     socket.on('close', () => sockets.delete(socket));
     socket.once('data', () => {
       socket.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n16.192\r\n');
-      setImmediate(() => socket.end('7\r\n.228.28\r\n0\r\n\r\n'));
+      // Keep the connection open: completion follows framing, not EOF.
+      setImmediate(() => socket.write('7\r\n.228.28\r\n0\r\n\r\n'));
     });
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -64,4 +65,26 @@ it('HTTP bridge probes decode chunked echoes across real TCP packets', async () 
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((r) => server.close(() => r()));
   }
+});
+
+it('streaming framing waits for the exact body and rejects malformed data', () => {
+  const head = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n';
+  assert.equal(tryParseFramedHttpResponse(Buffer.from(head + 'o')), null);
+  assert.deepEqual(tryParseFramedHttpResponse(Buffer.from(head + 'ok')), { statusCode: 200, body: 'ok' });
+  assert.throws(() => tryParseFramedHttpResponse(Buffer.from(head + 'oops')), /excessive/);
+  assert.equal(tryParseFramedHttpResponse(Buffer.from('HTTP/1.1 200 OK\r\n\r\nclose-delimited')), null);
+  assert.equal(tryParseFramedHttpResponse(Buffer.from('HTTP/1.1 103 Early Hints\r\n\r\n')), null);
+  assert.throws(() => tryParseFramedHttpResponse(Buffer.from('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokXX')), /invalid HTTP chunk terminator/);
+});
+
+it('HTTP content-length echoes finish while the TCP bridge remains open', async () => {
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((s) => {
+    sockets.add(s); s.once('close', () => sockets.delete(s));
+    s.once('data', () => s.write('HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n16.192.228.28'));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    assert.equal(await fetchViaHttpProxy('127.0.0.1', (server.address() as net.AddressInfo).port, 'http://echo.test/', 1000), '16.192.228.28');
+  } finally { for (const s of sockets) s.destroy(); await new Promise<void>((r) => server.close(() => r())); }
 });
