@@ -65,6 +65,18 @@ it('diagnostics identify the installed version and expand actual task names and 
   } finally { monitor.dispose(); }
 });
 
+it('the extension forwards the direct AWS subprocess environment', async () => {
+  const { monitor } = createMonitor();
+  const original = tasks.defaultExecAsync;
+  const options = { env: { NO_PROXY: '*' } };
+  tasks.defaultExecAsync = async (_file: string, _args: string[], _timeout: number, received: unknown) => {
+    assert.equal(received, options);
+    return 'direct AWS response';
+  };
+  try { assert.equal(await monitor.proxyExec('aws', [], 1000, options), 'direct AWS response'); }
+  finally { tasks.defaultExecAsync = original; monitor.dispose(); }
+});
+
 it('manual recovery preserves the actual startup error in diagnostics and its notification', async () => {
   const { monitor } = createMonitor();
   const detail = 'SSH exited with code 255: Host key verification failed.';
@@ -226,6 +238,39 @@ it('persisted off mode starts neither timers, probes nor bootstrap recovery', as
     assert.equal(monitor.timer, null);
     assert.equal(monitor.publicIpTimer, null);
     assert.equal(monitor.display, 'OFF');
+  } finally { monitor.dispose(); }
+});
+
+it('enabled startup bootstraps an unhealthy proxy once before the strike threshold', async () => {
+  const { monitor } = createMonitor();
+  let recoveries = 0;
+  let finish!: () => void;
+  const recovered = new Promise<void>((r) => { finish = r; });
+  health.runHealthCheckGuarded = async () => healthResult(false);
+  monitor.runDirectRecovery = async (reason: string) => {
+    assert.equal(reason, 'startup');
+    recoveries++;
+    finish();
+  };
+  try {
+    monitor.start();
+    await recovered;
+    assert.ok(monitor.timer);
+    await monitor.maybeBootstrap();
+    assert.equal(recoveries, 1);
+  } finally { monitor.dispose(); }
+});
+
+it('healthy startup monitors without restarting the working proxy', async () => {
+  const { monitor } = createMonitor();
+  health.runHealthCheckGuarded = async () => healthResult(true);
+  monitor.runDirectRecovery = async () => assert.fail('healthy proxy restarted at startup');
+  try {
+    monitor.start();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(monitor.bootstrapDone, true);
+    assert.equal(monitor.baseState, 'HEALTHY');
+    assert.ok(monitor.timer);
   } finally { monitor.dispose(); }
 });
 

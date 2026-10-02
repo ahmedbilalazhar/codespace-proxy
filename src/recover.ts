@@ -13,7 +13,7 @@
 
 import { execFile } from 'child_process';
 import type { HealthState } from './health';
-import { parseSchtasksRow, type ExecAsync } from './diagnose';
+import { parseSchtasksRow, type ExecAsync, type ExecOptions } from './diagnose';
 import { waitForPort } from './runbook';
 
 export interface RecoverConfig {
@@ -354,9 +354,9 @@ function firstLine(s: string): string {
   return String(s).split('\n')[0].slice(0, 200);
 }
 
-export function defaultExecAsync(file: string, args: string[], timeoutMs: number): Promise<string> {
+export function defaultExecAsync(file: string, args: string[], timeoutMs: number, options?: ExecOptions): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+    execFile(file, args, { ...options, timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
       if (err) {
         reject(err);
       } else {

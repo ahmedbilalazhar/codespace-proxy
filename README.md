@@ -1,12 +1,12 @@
-# OpenCode Proxy Health (v0.11.2)
+# OpenCode Proxy Health (v0.11.3)
 
-## Install v0.11.2
+## Install v0.11.3
 
-Download [opencode-proxy-health-0.11.2.vsix](releases/opencode-proxy-health-0.11.2.vsix)
+Download [opencode-proxy-health-0.11.3.vsix](releases/opencode-proxy-health-0.11.3.vsix)
 using GitHub's **Download raw file** button. In VS Code, run
 **Extensions: Install from VSIX**, select that file, and then run
 **Developer: Reload Window**. Confirm the OpenCode Proxy output log reports
-`version 0.11.2`. This updates the extension without merging unrelated Git
+`version 0.11.3`. This updates the extension without merging unrelated Git
 histories or requiring a local build.
 
 This version includes SSH startup diagnostics, safe roaming security-group
@@ -16,10 +16,30 @@ connection, preventing false timeouts on persistent connections. Partial or
 malformed responses remain failures. Windows AWS CLI arguments reject command
 expansion characters instead of letting settings be interpreted by cmd.exe.
 
+v0.11.3 also prevents VS Code's extension-host HTTP proxy wrappers from routing
+direct public-IP discovery through the tunnel. An explicit HTTP agent alone
+was insufficient with `http.proxySupport: "override"`. Discovery now constructs
+the native client request with a dedicated HTTP/TLS agent; HTTPS certificate
+verification stays enabled.
+AWS CLI repair subprocesses also receive a direct environment without inherited
+proxy variables. The parent environment and existing AWS authentication remain
+unchanged, so a dead localhost proxy cannot prevent its own security-group repair.
+
 To build from source: `npm ci`, `npm test`, then `npm run package`. The output
 filename follows the version in `package.json`.
 
 ## Automatic recovery after changing Wi-Fi
+
+The one-time SSH host-trust prompt is saved in Windows `known_hosts`. It is not
+required on every start. With Proxy On and the settings below, opening VS Code
+starts monitoring, checks the existing chain, and starts SSH and the HTTP bridge
+if needed. A working chain is left running. Subsequent outages trigger bounded
+background retries, and public-IP polling detects Wi-Fi changes.
+
+This supervisor runs while VS Code is open. It is not a Windows login service.
+Keep the legacy Task Scheduler tunnel/bridge tasks disabled so there is only
+one supervisor. Proxy Off persists across restarts; use **OpenCode Proxy: Turn
+Proxy On** once if you previously turned it off.
 
 In **Preferences: Open User Settings (JSON)**, merge these settings into your
 existing object. Replace the security-group placeholder with the group attached
@@ -102,7 +122,7 @@ it does not prove SOCKS forwarding or the HTTP bridge is working yet.
 
 Pulling the repository does not update the installed VSIX. After updating,
 build/package/install as described below and reload VS Code. Confirm the
-startup log says `version 0.11.2`.
+startup log says `version 0.11.3`.
 
 ## VS Code shows "Error acquiring .NET" / WebRequestError
 

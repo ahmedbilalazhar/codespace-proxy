@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.3
+
+- Bypass VS Code's HTTP proxy overrides during direct public-IP discovery so
+  Wi-Fi repair does not authorize the proxy server's IP instead of the laptop.
+- Retain HTTPS certificate validation and bounded networking timeouts.
+- Strip inherited proxy settings from AWS CLI repair subprocesses so security
+  group updates can run while the localhost proxy is down.
+- Verify automatic startup recovery before the failure threshold, healthy
+  startup without unnecessary restarts, and persistent Proxy Off behavior.
+- Document one-time SSH host trust and automatic startup/roaming settings.
+
 ## 0.11.2
 
 - Finish framed HTTP/SOCKS responses and bodyless HTTPS probes as soon as they

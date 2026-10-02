@@ -2,6 +2,7 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { ensureSshAccess, DEFAULT_AWSNET_CONFIG, fetchDirectUrl, fetchDirectPublicIp, awsCliInvocation } from '../src/awsNet';
+import { defaultExecAsync } from '../src/recover';
 
 const cfg = { ...DEFAULT_AWSNET_CONFIG, securityGroupId: 'sg-test' };
 const perms = (ranges: Array<{ CidrIp: string; Description?: string }>, port = 22) => JSON.stringify([
@@ -9,6 +10,30 @@ const perms = (ranges: Array<{ CidrIp: string; Description?: string }>, port = 2
 ]);
 const old = { CidrIp: '1.1.1.1/32', Description: 'opencode-proxy' };
 const current = { CidrIp: '9.9.9.9/32', Description: 'opencode-proxy' };
+
+it('AWS repair bypasses a dead proxy in its child environment and leaves the parent unchanged', async () => {
+  const saved = process.env.HTTPS_PROXY;
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:1';
+  try {
+    const result = await ensureSshAccess(async (_file, _args, timeout, options) => {
+      assert.ok(options?.env);
+      assert.equal(options.env.HTTPS_PROXY, undefined);
+      assert.equal(options.env.NO_PROXY, '*');
+      assert.equal(options.env.PATH, process.env.PATH);
+      assert.equal(process.env.HTTPS_PROXY, 'http://127.0.0.1:1');
+      // Verify that the production subprocess runner forwards those options.
+      const check = await defaultExecAsync(process.execPath, ['-e',
+        'process.stdout.write(JSON.stringify({proxy:process.env.HTTPS_PROXY,bypass:process.env.NO_PROXY}))'], timeout, options);
+      assert.deepEqual(JSON.parse(check), { bypass: '*' });
+      return perms([current]);
+    }, cfg, '9.9.9.9');
+    assert.equal(result.ok, true);
+    assert.equal(process.env.HTTPS_PROXY, 'http://127.0.0.1:1');
+  } finally {
+    if (saved === undefined) delete process.env.HTTPS_PROXY;
+    else process.env.HTTPS_PROXY = saved;
+  }
+});
 
 it('Windows AWS invocation rejects shell expansion while preserving ordinary profiles', () => {
   const args = ['ec2', 'describe-security-groups', '--profile', 'home profile'];
@@ -84,11 +109,11 @@ it('invalid AWS output fails without any write', async () => {
 
 it('late errors from a completed direct fetch do not release another fetch bypass', async () => {
   const http = require('node:http');
-  const originalGet = http.get;
+  const originalRequest = http.ClientRequest;
   const saved = process.env.HTTP_PROXY;
   const requests: Array<{ req: EventEmitter; respond: (res: unknown) => void }> = [];
-  http.get = (_url: string, _opts: unknown, respond: (res: unknown) => void) => {
-    const req = Object.assign(new EventEmitter(), { destroy: () => {} });
+  http.ClientRequest = function (_opts: unknown, respond: (res: unknown) => void) {
+    const req = Object.assign(new EventEmitter(), { destroy: () => {}, end: () => {} });
     requests.push({ req, respond });
     return req;
   };
@@ -110,7 +135,7 @@ it('late errors from a completed direct fetch do not release another fetch bypas
     await second;
     assert.equal(process.env.HTTP_PROXY, 'http://127.0.0.1:8080');
   } finally {
-    http.get = originalGet;
+    http.ClientRequest = originalRequest;
     if (saved === undefined) delete process.env.HTTP_PROXY;
     else process.env.HTTP_PROXY = saved;
   }

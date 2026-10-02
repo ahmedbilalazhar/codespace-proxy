@@ -2,7 +2,7 @@
   "name": "opencode-proxy-health",
   "displayName": "OpenCode Proxy Health",
   "description": "VS Code status-bar monitor for the OpenCode SSH SOCKS5 + HTTP bridge + Zen/Muse Spark chain, with one-click recovery runbook and opt-in self-healing.",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "publisher": "local",
   "license": "MIT",
   "engines": {

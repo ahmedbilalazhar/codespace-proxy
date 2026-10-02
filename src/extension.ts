@@ -74,7 +74,7 @@ import {
   updateHistory,
   uptimeSummary,
 } from './history';
-import { DeepInfo, deepDiagnose, emptyDeep, formatDeep } from './diagnose';
+import { DeepInfo, deepDiagnose, emptyDeep, formatDeep, type ExecAsync } from './diagnose';
 import {
   RecoverAttempt,
   RecoverConfig,
@@ -531,9 +531,9 @@ export class Monitor {
     }
   }
 
-  private proxyExec = (file: string, args: string[], timeout: number): Promise<string> => {
+  private proxyExec: ExecAsync = (file, args, timeout, options) => {
     if (!this.lifecycle.enabled) return Promise.reject(new Error('Proxy is turned off'));
-    return defaultExecAsync(file, args, timeout);
+    return defaultExecAsync(file, args, timeout, options);
   };
 
   turnOff(): Promise<void> {

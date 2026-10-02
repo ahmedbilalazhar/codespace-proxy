@@ -1,1 +1,2 @@
 1a520408b6125ff144f6123b1fb5ab61b160ba96501fdbfc7e9fdd2345fd3497  opencode-proxy-health-0.11.2.vsix
+6a82c4ed4fa2d10b1f1dedf31a20a7ba2861dd9ffe6aa71a5684ab06cdda1aac  opencode-proxy-health-0.11.3.vsix

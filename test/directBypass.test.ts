@@ -9,6 +9,41 @@ import assert from 'node:assert/strict';
 import * as net from 'net';
 import { fetchDirectUrl } from '../src/awsNet';
 
+it('direct requests bypass extension-host HTTP wrappers that replace explicit agents', async () => {
+  const http = require('node:http');
+  const https = require('node:https');
+  const originals = [http.get, http.request, https.get, https.request];
+  let wrappedCalls = 0;
+  const redirected = () => { wrappedCalls++; throw new Error('VS Code proxy override used'); };
+  const server = http.createServer((_req: unknown, res: any) => { res.end('9.9.9.9'); });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  http.get = http.request = https.get = https.request = redirected;
+  try {
+    const port = (server.address() as net.AddressInfo).port;
+    assert.equal(await fetchDirectUrl(`http://127.0.0.1:${port}/`, 1000), '9.9.9.9');
+    assert.equal(wrappedCalls, 0);
+  } finally {
+    [http.get, http.request, https.get, https.request] = originals;
+    await new Promise<void>((r) => server.close(r));
+  }
+});
+
+it('direct HTTPS retains a TLS agent and certificate verification without proxy wrappers', async () => {
+  const https = require('node:https');
+  const original = https.Agent.prototype.createConnection;
+  let tlsUsed = false;
+  https.Agent.prototype.createConnection = (options: any) => {
+    tlsUsed = true;
+    assert.equal(options.host, 'example.test');
+    assert.notEqual(options.rejectUnauthorized, false);
+    throw new Error('certificate verification failed');
+  };
+  try {
+    await assert.rejects(() => fetchDirectUrl('https://example.test/', 1000), /certificate verification failed/);
+    assert.equal(tlsUsed, true);
+  } finally { https.Agent.prototype.createConnection = original; }
+});
+
 describe('fetchDirectUrl concurrent bypass (refcount)', () => {
   it('a second overlapping direct fetch never sees proxy env restored mid-flight', async () => {
     const prevHttp = process.env.HTTP_PROXY;

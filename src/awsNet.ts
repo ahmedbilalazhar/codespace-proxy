@@ -66,7 +66,11 @@ export type FetchDirect = (url: string, timeoutMs: number) => Promise<string>;
  * DIRECT fetch of one URL, ALWAYS bypassing HTTP_PROXY/HTTPS_PROXY.
  * Node http/https do not auto-use proxy env, but we enforce the bypass
  * explicitly: snapshot + delete proxy vars for the duration of the request
- * (restored afterwards) and use a dedicated no-proxy agent. This function
+ * (restored afterwards) and use a dedicated no-proxy agent. Construct the
+ * ClientRequest directly: VS Code patches http/https.get and .request and
+ * can replace even an explicit agent when http.proxySupport is "override".
+ * Bootstrap networking must not depend on the proxy it is repairing.
+ * This function
  * never touches 127.0.0.1:8080 or 127.0.0.1:1080.
  */
 const PROXY_ENV_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
@@ -144,7 +148,6 @@ export function fetchDirectUrl(url: string, timeoutMs: number): Promise<string> 
       reject(new Error(`bad direct IP URL: ${url}`));
       return;
     }
-    const lib = u.protocol === 'https:' ? https : http;
     const agent = u.protocol === 'https:' ? new https.Agent({ keepAlive: false }) : new http.Agent({ keepAlive: false });
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
@@ -159,9 +162,10 @@ export function fetchDirectUrl(url: string, timeoutMs: number): Promise<string> 
       fn();
     };
     let req: http.ClientRequest;
-    try { req = lib.get(
-      url,
-      { timeout: timeoutMs, family: 4, headers: { 'User-Agent': 'opencode-proxy-health' }, agent },
+    try { req = new http.ClientRequest(
+      { protocol: u.protocol, hostname: u.hostname, port: u.port || undefined,
+        path: `${u.pathname}${u.search}`, method: 'GET',
+        timeout: timeoutMs, family: 4, headers: { 'User-Agent': 'opencode-proxy-health' }, agent },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();
@@ -187,6 +191,7 @@ export function fetchDirectUrl(url: string, timeoutMs: number): Promise<string> 
       done(() => reject(new Error(`timed out after ${timeoutMs}ms fetching ${url} directly (proxy bypassed)`)));
     });
     req.on('error', (e) => done(() => reject(e as Error)));
+    req.end();
     timer = setTimeout(() => {
       try {
         req.destroy();
@@ -273,7 +278,14 @@ export function awsCliInvocation(args: string[], platform: string = process.plat
 
 function runAws(exec: ExecAsync, args: string[], timeoutMs: number): Promise<string> {
   const invocation = awsCliInvocation(args);
-  return exec(invocation.file, invocation.args, timeoutMs);
+  // Repair must reach AWS while the tunnel is down. Strip proxies from the
+  // child's environment only; preserve the existing AWS profile and credentials.
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (PROXY_ENV_VARS.some((proxyKey) => proxyKey.toLowerCase() === key.toLowerCase())) delete env[key];
+  }
+  env.NO_PROXY = '*';
+  return exec(invocation.file, invocation.args, timeoutMs, { env });
 }
 
 /** Describe TCP-22 ingress rules on the SG. Never throws — failures are data. */
